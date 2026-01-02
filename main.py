@@ -7,7 +7,6 @@ import threading
 from flask import Flask
 import os
 
-# Variáveis de ambiente (seguras no Render)
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('CHAT_ID')
 
@@ -105,60 +104,82 @@ def check_signals():
         except Exception as e:
             print(f"Erro em {symbol}: {e}")
 
-# Flask com dashboard ULTRA MODERNO (Tailwind + Glassmorphism)
 app = Flask(__name__)
 
 @app.route('/')
 def home():
     return '''
 <!DOCTYPE html>
-<html lang="pt-BR" class="dark">
+<html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Bot Sinais Cripto AI</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
+    <title>Bot Sinais Cripto</title>
     <style>
-        body { background: linear-gradient(135deg, #0f0c29, #302b63, #24243e); min-height: 100vh; }
-        .glass { background: rgba(255, 255, 255, 0.05); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.1); }
-        .glow { box-shadow: 0 0 30px rgba(59, 130, 246, 0.4); }
+        body { font-family: Arial, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 0; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        header { text-align: center; padding: 50px 20px; background: linear-gradient(135deg, #1e293b, #0f172a); }
+        h1 { font-size: 3rem; color: #60a5fa; }
+        .status { text-align: center; padding: 20px; background: #1e293b; border-radius: 12px; margin: 20px 0; }
+        .online { color: #34d399; }
+        .card { background: #1e293b; border-radius: 12px; padding: 25px; margin: 20px 0; }
+        .pair-list ul { list-style: none; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+        .pair-list li { background: #334155; padding: 15px; border-radius: 10px; text-align: center; }
+        footer { text-align: center; padding: 40px; color: #64748b; }
     </style>
 </head>
-<body class="text-gray-100">
-    <div class="container mx-auto px-4 py-8 max-w-7xl">
-        <header class="text-center mb-12">
-            <h1 class="text-5xl md:text-6xl font-bold bg-gradient-to-r from-blue-400 to-purple-600 bg-clip-text text-transparent">
-                <i class="fas fa-robot mr-4"></i> Bot Sinais Cripto AI
-            </h1>
-            <p class="text-xl mt-4 text-gray-300">Dashboard Inteligente • Timeframe 5min • 9 Pares Monitorados</p>
-        </header>
+<body>
+    <header>
+        <h1>🚀 Bot de Sinais Cripto</h1>
+        <p>Dashboard em tempo real • 9 Pares • Timeframe 5min</p>
+    </header>
 
-        <div class="glass rounded-3xl p-10 text-center glow mb-10">
-            <h2 class="text-3xl font-bold mb-4"><i class="fas fa-satellite-dish text-green-400 mr-3"></i> Status do Bot</h2>
-            <p class="text-2xl"><span class="text-green-400 font-bold">● ONLINE E ATIVO</span></p>
-            <p class="text-lg mt-3 text-gray-300">Verificando sinais a cada 5 minutos • Estratégias combinadas</p>
+    <div class="container">
+        <div class="status">
+            <strong>Status do Bot:</strong> <span class="online">● ONLINE E ATIVO</span><br>
+            <small>Verificando a cada 5 minutos</small>
         </div>
 
-        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 mb-10">
-            <div class="glass rounded-3xl p-8 glow">
-                <h2 class="text-2xl font-bold mb-6 flex items-center"><i class="fas fa-bell text-yellow-400 mr-3"></i> Últimos Sinais Enviados</h2>
-                <div id="signals-list" class="space-y-4">
-                    <p class="text-center text-gray-400 py-12">Aguardando sinais de alta precisão...<br><small class="text-sm">Apenas sinais confirmados por 2+ estratégias</small></p>
-                </div>
-            </div>
+        <div class="card">
+            <h2>📊 Últimos Sinais Enviados</h2>
+            <p style="text-align:center;">Aguardando sinais...</p>
+        </div>
 
-            <div class="glass rounded-3xl p-8 glow">
-                <h2 class="text-2xl font-bold mb-6 flex items-center"><i class="fas fa-coins text-orange-400 mr-3"></i> Pares Monitorados</h2>
-                <div class="grid grid-cols-2 md:grid-cols-3 gap-4 text-center">
-                    <div class="bg-blue-900/40 rounded-xl p-4 glow"><strong>BTC/USDT</strong></div>
-                    <div class="bg-purple-900/40 rounded-xl p-4 glow"><strong>ETH/USDT</strong></div>
-                    <div class="bg-green-900/40 rounded-xl p-4 glow"><strong>SOL/USDT</strong></div>
-                    <div class="bg-yellow-900/40 rounded-xl p-4 glow"><strong>BNB/USDT</strong></div>
-                    <div class="bg-pink-900/40 rounded-xl p-4 glow"><strong>ADA/USDT</strong></div>
-                    <div class="bg-indigo-900/40 rounded-xl p-4 glow"><strong>XRP/USDT</strong></div>
-                    <div class="bg-orange-900/40 rounded-xl p-4 glow"><strong>DOGE/USDT</strong></div>
-                    <div class="bg-teal-900/40 rounded-xl p-4 glow"><strong>LINK/USDT</strong></div>
-                    <div class="bg-red-900/40 rounded-xl p-4 glow"><strong>AVAX/USDT</strong></div>
-                </div>
-            </div
+        <div class="card">
+            <h2>📈 Pares Monitorados</h2>
+            <div class="pair-list">
+                <ul>
+                    <li>BTC/USDT</li>
+                    <li>ETH/USDT</li>
+                    <li>SOL/USDT</li>
+                    <li>BNB/USDT</li>
+                    <li>ADA/USDT</li>
+                    <li>XRP/USDT</li>
+                    <li>DOGE/USDT</li>
+                    <li>LINK/USDT</li>
+                    <li>AVAX/USDT</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <footer>
+        Bot criado por você • Janeiro 2026
+    </footer>
+</body>
+</html>
+    '''
+
+def run_flask():
+    app.run(host='0.0.0.0', port=8080)
+
+def run_bot():
+    schedule.every(5).minutes.do(check_signals)
+    bot.send_message(CHAT_ID, "🤖 Bot corrigido! Dashboard leve ativado novamente.")
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+if __name__ == '__main__':
+    threading.Thread(target=run_flask).start()
+    run_bot()
