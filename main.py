@@ -86,13 +86,15 @@ def generate_signal(df, symbol):
     
     if buys >= 2 or sells >= 2:
         entry = df['close'].iloc[-1]
+        direction = 'COMPRA' if buys >= 2 else 'VENDA'
+        emoji = '🚀' if buys >= 2 else '🔻'
         tp = entry * 1.05 if buys >= 2 else entry * 0.95
         sl = entry * 0.97 if buys >= 2 else entry * 1.03
-        return f"🚀 SINAL DE COMPRA para {symbol}!\nEntry: {entry:.2f}\nTP: {tp:.2f} (+5%)\nSL: {sl:.2f}" if buys >= 2 else f"🔻 SINAL DE VENDA para {symbol}!\nEntry: {entry:.2f}\nTP: {tp:.2f} (-5%)\nSL: {sl:.2f}"
+        return f"{emoji} SINAL DE {direction} para {symbol}!\nEntry: {entry:.2f}\nTP: {tp:.2f} (+5%)\nSL: {sl:.2f}"
     return None
 
 def check_signals():
-    symbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'ADAUSDT', 'XRPUSDT', 'DOGEUSDT', 'LINKUSDT', 'AVAXUSDT']  # Mais pares adicionados
+    symbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'ADAUSDT', 'XRPUSDT', 'DOGEUSDT', 'LINKUSDT', 'AVAXUSDT']
     for symbol in symbols:
         try:
             df = get_binance_data(symbol)
@@ -103,95 +105,60 @@ def check_signals():
         except Exception as e:
             print(f"Erro em {symbol}: {e}")
 
-# Flask com dashboard bonito
+# Flask com dashboard ULTRA MODERNO (Tailwind + Glassmorphism)
 app = Flask(__name__)
 
 @app.route('/')
 def home():
     return '''
 <!DOCTYPE html>
-<html lang="pt-BR">
+<html lang="pt-BR" class="dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Bot Sinais Cripto - Dashboard</title>
+    <title>Bot Sinais Cripto AI</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
     <style>
-        body { font-family: 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 0; }
-        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
-        header { text-align: center; padding: 60px 20px; background: linear-gradient(135deg, #1e293b, #0f172a); border-bottom: 3px solid #60a5fa; }
-        h1 { font-size: 3rem; margin: 0; color: #60a5fa; }
-        h2 { color: #60a5fa; border-bottom: 2px solid #334155; padding-bottom: 10px; }
-        .status { text-align: center; padding: 20px; font-size: 1.4rem; background: #1e293b; border-radius: 12px; margin: 20px 0; }
-        .online { color: #34d399; font-weight: bold; }
-        .card { background: #1e293b; border-radius: 12px; padding: 25px; margin: 20px 0; box-shadow: 0 6px 25px rgba(0,0,0,0.4); }
-        .signals { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
-        .signal { background: #334155; padding: 20px; border-radius: 12px; border-left: 6px solid #60a5fa; }
-        .buy { border-left-color: #34d399; }
-        .sell { border-left-color: #f87171; }
-        .pair-list { line-height: 2rem; font-size: 1.1rem; }
-        footer { text-align: center; padding: 40px; color: #64748b; font-size: 0.95rem; margin-top: 50px; border-top: 1px solid #334155; }
-        @media (max-width: 768px) { h1 { font-size: 2.2rem; } .signals { grid-template-columns: 1fr; } }
+        body { background: linear-gradient(135deg, #0f0c29, #302b63, #24243e); min-height: 100vh; }
+        .glass { background: rgba(255, 255, 255, 0.05); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.1); }
+        .glow { box-shadow: 0 0 30px rgba(59, 130, 246, 0.4); }
     </style>
 </head>
-<body>
-    <header>
-        <h1>🚀 Bot de Sinais Cripto</h1>
-        <p>Dashboard em tempo real • Estratégia: MA Crossover + RSI + MACD (5min timeframe)</p>
-    </header>
+<body class="text-gray-100">
+    <div class="container mx-auto px-4 py-8 max-w-7xl">
+        <header class="text-center mb-12">
+            <h1 class="text-5xl md:text-6xl font-bold bg-gradient-to-r from-blue-400 to-purple-600 bg-clip-text text-transparent">
+                <i class="fas fa-robot mr-4"></i> Bot Sinais Cripto AI
+            </h1>
+            <p class="text-xl mt-4 text-gray-300">Dashboard Inteligente • Timeframe 5min • 9 Pares Monitorados</p>
+        </header>
 
-    <div class="container">
-        <div class="status">
-            <strong>Status do Bot:</strong> <span class="online">● ONLINE E ATIVO</span><br>
-            <small>Verificando a cada 5 minutos • Sinal só se 2+ estratégias concordarem</small>
+        <div class="glass rounded-3xl p-10 text-center glow mb-10">
+            <h2 class="text-3xl font-bold mb-4"><i class="fas fa-satellite-dish text-green-400 mr-3"></i> Status do Bot</h2>
+            <p class="text-2xl"><span class="text-green-400 font-bold">● ONLINE E ATIVO</span></p>
+            <p class="text-lg mt-3 text-gray-300">Verificando sinais a cada 5 minutos • Estratégias combinadas</p>
         </div>
 
-        <div class="card">
-            <h2>📊 Últimos Sinais Enviados</h2>
-            <div class="signals">
-                <p style="text-align:center; color:#94a3b8; grid-column: 1 / -1;">
-                    Aguardando primeiros sinais...<br>
-                    <small>Sinais enviados apenas quando 2+ estratégias confirmam</small>
-                </p>
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 mb-10">
+            <div class="glass rounded-3xl p-8 glow">
+                <h2 class="text-2xl font-bold mb-6 flex items-center"><i class="fas fa-bell text-yellow-400 mr-3"></i> Últimos Sinais Enviados</h2>
+                <div id="signals-list" class="space-y-4">
+                    <p class="text-center text-gray-400 py-12">Aguardando sinais de alta precisão...<br><small class="text-sm">Apenas sinais confirmados por 2+ estratégias</small></p>
+                </div>
             </div>
-        </div>
 
-        <div class="card">
-            <h2>📈 Pares Monitorados</h2>
-            <div class="pair-list">
-                <ul>
-                    <li>🪙 BTC/USDT</li>
-                    <li>🪙 ETH/USDT</li>
-                    <li>🪙 SOL/USDT</li>
-                    <li>🪙 BNB/USDT</li>
-                    <li>🪙 ADA/USDT</li>
-                    <li>🪙 XRP/USDT</li>
-                    <li>🪙 DOGE/USDT</li>
-                    <li>🪙 LINK/USDT</li>
-                    <li>🪙 AVAX/USDT</li>
-                </ul>
-            </div>
-            <p><strong>Estratégias:</strong> MA Crossover, RSI, MACD (combinadas para >70% acerto em backtests)</p>
-            <p><strong>TP:</strong> +5% | <strong>SL:</strong> ~3%</p>
-        </div>
-    </div>
-
-    <footer>
-        Bot criado por você • Janeiro/2026 • Todos os direitos reservados ©
-    </footer>
-</body>
-</html>
-    '''
-
-def run_flask():
-    app.run(host='0.0.0.0', port=8080)
-
-def run_bot():
-    schedule.every(5).minutes.do(check_signals)
-    bot.send_message(CHAT_ID, "🤖 Bot atualizado! Mais pares adicionados. Verificando a cada 5 minutos.")
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
-
-if __name__ == '__main__':
-    threading.Thread(target=run_flask).start()
-    run_bot()
+            <div class="glass rounded-3xl p-8 glow">
+                <h2 class="text-2xl font-bold mb-6 flex items-center"><i class="fas fa-coins text-orange-400 mr-3"></i> Pares Monitorados</h2>
+                <div class="grid grid-cols-2 md:grid-cols-3 gap-4 text-center">
+                    <div class="bg-blue-900/40 rounded-xl p-4 glow"><strong>BTC/USDT</strong></div>
+                    <div class="bg-purple-900/40 rounded-xl p-4 glow"><strong>ETH/USDT</strong></div>
+                    <div class="bg-green-900/40 rounded-xl p-4 glow"><strong>SOL/USDT</strong></div>
+                    <div class="bg-yellow-900/40 rounded-xl p-4 glow"><strong>BNB/USDT</strong></div>
+                    <div class="bg-pink-900/40 rounded-xl p-4 glow"><strong>ADA/USDT</strong></div>
+                    <div class="bg-indigo-900/40 rounded-xl p-4 glow"><strong>XRP/USDT</strong></div>
+                    <div class="bg-orange-900/40 rounded-xl p-4 glow"><strong>DOGE/USDT</strong></div>
+                    <div class="bg-teal-900/40 rounded-xl p-4 glow"><strong>LINK/USDT</strong></div>
+                    <div class="bg-red-900/40 rounded-xl p-4 glow"><strong>AVAX/USDT</strong></div>
+                </div>
+            </div
