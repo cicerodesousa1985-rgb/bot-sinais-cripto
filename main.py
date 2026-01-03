@@ -1,15 +1,19 @@
 import telebot
 import requests
 import pandas as pd
+import numpy as np
 import time
 import schedule
 import threading
-from flask import Flask, render_template_string
+from flask import Flask, render_template_string, jsonify, request
 import os
 from datetime import datetime, timedelta
 import logging
-from typing import Optional, List, Dict
+import talib
+from typing import Optional, List, Dict, Tuple
 import json
+import warnings
+warnings.filterwarnings('ignore')
 
 # =========================
 # CONFIGURAÇÃO DE LOG
@@ -18,7 +22,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('bot_scalping.log'),
+        logging.FileHandler('crypto_bot.log'),
         logging.StreamHandler()
     ]
 )
@@ -38,20 +42,77 @@ bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode='HTML')
 # Estados do bot
 signals_paused = False
 last_signals = []
-signal_cache = {}  # Cache para evitar sinais duplicados
+signal_cache = {}
 bot_start_time = datetime.now()
 
-# Configuração de pares
+# =========================
+# LISTA EXPANDIDA DE PARES (30+ pares)
+# =========================
 PAIRS = [
-    'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT',
-    'ADAUSDT', 'XRPUSDT', 'DOGEUSDT', 'LINKUSDT', 'AVAXUSDT'
+    # Top 10 por market cap
+    'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
+    'ADAUSDT', 'AVAXUSDT', 'DOGEUSDT', 'DOTUSDT', 'TRXUSDT',
+    
+    # Mid caps populares
+    'LINKUSDT', 'MATICUSDT', 'SHIBUSDT', 'LTCUSDT', 'UNIUSDT',
+    'ATOMUSDT', 'ETCUSDT', 'XLMUSDT', 'ALGOUSDT', 'VETUSDT',
+    
+    # Altcoins promissores
+    'FILUSDT', 'ICPUSDT', 'NEARUSDT', 'FTMUSDT', 'AAVEUSDT',
+    'APEUSDT', 'GRTUSDT', 'SANDUSDT', 'MANAUSDT', 'AXSUSDT',
+    
+    # DeFi tokens
+    'MKRUSDT', 'SNXUSDT', 'COMPUSDT', 'YFIUSDT', 'CRVUSDT',
+    
+    # Layer 1 alternatives
+    'FTTUSDT', 'EGLDUSDT', 'ONEUSDT', 'HNTUSDT', 'KLAYUSDT',
+    
+    # Meme coins & trending
+    'PEPEUSDT', 'FLOKIUSDT', 'BONKUSDT', 'WIFUSDT'
 ]
 
-# Configurações de estratégia
+# Agrupa por categoria para melhor organização
+PAIR_CATEGORIES = {
+    'blue_chips': ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT'],
+    'large_caps': ['ADAUSDT', 'AVAXUSDT', 'DOGEUSDT', 'DOTUSDT', 'TRXUSDT', 'LINKUSDT'],
+    'mid_caps': ['MATICUSDT', 'SHIBUSDT', 'LTCUSDT', 'UNIUSDT', 'ATOMUSDT', 'ETCUSDT'],
+    'defi': ['AAVEUSDT', 'MKRUSDT', 'SNXUSDT', 'COMPUSDT', 'CRVUSDT'],
+    'gaming_metaverse': ['SANDUSDT', 'MANAUSDT', 'AXSUSDT', 'GALAUSDT', 'ENJUSDT'],
+    'meme_coins': ['PEPEUSDT', 'FLOKIUSDT', 'BONKUSDT', 'WIFUSDT']
+}
+
+# =========================
+# ESTRATÉGIAS EXPANDIDAS (15+ estratégias)
+# =========================
 STRATEGIES = {
-    'ema_vwap': {'weight': 1.0, 'active': True},
-    'rsi_scalping': {'weight': 0.8, 'active': True},
-    'macd': {'weight': 0.9, 'active': True}
+    # Estratégias de tendência
+    'ema_crossover': {'weight': 1.2, 'active': True, 'category': 'trend'},
+    'macd_crossover': {'weight': 1.1, 'active': True, 'category': 'trend'},
+    'supertrend': {'weight': 1.3, 'active': True, 'category': 'trend'},
+    'ichimoku': {'weight': 1.0, 'active': True, 'category': 'trend'},
+    'adx_trend': {'weight': 0.9, 'active': True, 'category': 'trend'},
+    
+    # Estratégias de momentum
+    'rsi_divergence': {'weight': 1.1, 'active': True, 'category': 'momentum'},
+    'stochastic': {'weight': 0.8, 'active': True, 'category': 'momentum'},
+    'cci': {'weight': 0.7, 'active': True, 'category': 'momentum'},
+    'mfi': {'weight': 0.9, 'active': True, 'category': 'momentum'},
+    'williams_r': {'weight': 0.8, 'active': True, 'category': 'momentum'},
+    
+    # Estratégias de reversão
+    'bollinger_bands': {'weight': 1.0, 'active': True, 'category': 'reversal'},
+    'pivot_points': {'weight': 0.9, 'active': True, 'category': 'reversal'},
+    'support_resistance': {'weight': 1.1, 'active': True, 'category': 'reversal'},
+    
+    # Estratégias de volume
+    'vwap': {'weight': 1.0, 'active': True, 'category': 'volume'},
+    'obv': {'weight': 0.8, 'active': True, 'category': 'volume'},
+    'volume_profile': {'weight': 0.9, 'active': True, 'category': 'volume'},
+    
+    # Estratégias avançadas
+    'fractals': {'weight': 0.7, 'active': True, 'category': 'advanced'},
+    'harmonics': {'weight': 0.6, 'active': True, 'category': 'advanced'},
+    'market_structure': {'weight': 1.2, 'active': True, 'category': 'advanced'}
 }
 
 # =========================
@@ -59,9 +120,16 @@ STRATEGIES = {
 # =========================
 def format_price(price: float, symbol: str) -> str:
     """Formata preço baseado no par"""
-    if 'BTC' in symbol or 'ETH' in symbol:
+    if price >= 1000:
+        return f"{price:.1f}"
+    elif price >= 100:
         return f"{price:.2f}"
-    return f"{price:.4f}"
+    elif price >= 10:
+        return f"{price:.3f}"
+    elif price >= 1:
+        return f"{price:.4f}"
+    else:
+        return f"{price:.6f}"
 
 def get_uptime() -> str:
     """Calcula tempo de atividade do bot"""
@@ -71,25 +139,31 @@ def get_uptime() -> str:
     minutes, seconds = divmod(remainder, 60)
     
     if days > 0:
-        return f"{days}d {hours}h {minutes}m"
-    return f"{hours}h {minutes}m {seconds}s"
+        return f"{days}d {hours}h"
+    return f"{hours}h {minutes}m"
+
+def get_pair_category(pair: str) -> str:
+    """Retorna categoria do par"""
+    for category, pairs in PAIR_CATEGORIES.items():
+        if pair in pairs:
+            return category.replace('_', ' ').title()
+    return "Other"
 
 # =========================
-# BINANCE DATA - COM TRATAMENTO DE ERROS
+# FUNÇÃO PARA DADOS DA BINANCE (OTIMIZADA)
 # =========================
 def get_binance_data(symbol: str, interval: str = '1m', limit: int = 300) -> Optional[pd.DataFrame]:
-    """Obtém dados da Binance com tratamento robusto de erros"""
+    """Obtém dados da Binance com múltiplos intervalos"""
     try:
         url = 'https://api.binance.com/api/v3/klines'
         params = {'symbol': symbol, 'interval': interval, 'limit': limit}
         
-        response = requests.get(url, params=params, timeout=10)
+        response = requests.get(url, params=params, timeout=15)
         response.raise_for_status()
         
         data = response.json()
         
         if not data:
-            logger.warning(f"Nenhum dado retornado para {symbol}")
             return None
             
         df = pd.DataFrame(data, columns=[
@@ -105,113 +179,584 @@ def get_binance_data(symbol: str, interval: str = '1m', limit: int = 300) -> Opt
         
         return df
         
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Erro na requisição para {symbol}: {e}")
-        return None
     except Exception as e:
-        logger.error(f"Erro ao processar dados de {symbol}: {e}")
+        logger.error(f"Erro ao obter dados para {symbol}: {e}")
         return None
 
 # =========================
-# INDICADORES OTIMIZADOS
+# ESTRATÉGIAS DE TENDÊNCIA (5 estratégias)
 # =========================
-def calculate_rsi(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Calcula RSI de forma mais eficiente"""
-    delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
-
-def calculate_macd(df: pd.DataFrame) -> tuple:
-    """Calcula MACD e Signal line"""
-    exp1 = df['close'].ewm(span=12, adjust=False).mean()
-    exp2 = df['close'].ewm(span=26, adjust=False).mean()
-    macd_line = exp1 - exp2
-    signal_line = macd_line.ewm(span=9, adjust=False).mean()
-    return macd_line, signal_line
-
-# =========================
-# ESTRATÉGIAS COM PESOS
-# =========================
-def ema_vwap_strategy(df: pd.DataFrame) -> Optional[str]:
-    """Estratégia EMA + VWAP"""
+def ema_crossover_strategy(df: pd.DataFrame) -> Optional[str]:
+    """EMA 9/21/50 Crossover"""
     try:
-        df['EMA9'] = df['close'].ewm(span=9, adjust=False).mean()
-        df['EMA21'] = df['close'].ewm(span=21, adjust=False).mean()
-        
-        tp = (df['high'] + df['low'] + df['close']) / 3
-        df['VWAP'] = (tp * df['volume']).cumsum() / df['volume'].cumsum()
+        df['EMA9'] = talib.EMA(df['close'], timeperiod=9)
+        df['EMA21'] = talib.EMA(df['close'], timeperiod=21)
+        df['EMA50'] = talib.EMA(df['close'], timeperiod=50)
         
         last, prev = df.iloc[-1], df.iloc[-2]
         
-        # Condições de compra
-        buy_conditions = (
-            last['close'] > last['VWAP'] and
-            last['EMA9'] > last['EMA21'] and
-            prev['EMA9'] <= prev['EMA21']
-        )
-        
-        # Condições de venda
-        sell_conditions = (
-            last['close'] < last['VWAP'] and
-            last['EMA9'] < last['EMA21'] and
-            prev['EMA9'] >= prev['EMA21']
-        )
-        
-        return 'buy' if buy_conditions else 'sell' if sell_conditions else None
-        
-    except Exception as e:
-        logger.error(f"Erro em EMA_VWAP: {e}")
-        return None
-
-def rsi_scalping_strategy(df: pd.DataFrame) -> Optional[str]:
-    """Estratégia RSI para scalping"""
-    try:
-        df['RSI'] = calculate_rsi(df)
-        r = df['RSI'].iloc[-1]
-        
-        if 30 < r < 45:
+        # Golden Cross
+        if (last['EMA9'] > last['EMA21'] > last['EMA50'] and 
+            (prev['EMA9'] <= prev['EMA21'] or prev['EMA21'] <= prev['EMA50'])):
             return 'buy'
-        elif 55 < r < 70:
+        
+        # Death Cross
+        if (last['EMA9'] < last['EMA21'] < last['EMA50'] and 
+            (prev['EMA9'] >= prev['EMA21'] or prev['EMA21'] >= prev['EMA50'])):
             return 'sell'
-        return None
+            
     except Exception as e:
-        logger.error(f"Erro em RSI Scalping: {e}")
-        return None
+        logger.error(f"Erro EMA Crossover: {e}")
+    return None
 
-def macd_strategy(df: pd.DataFrame) -> Optional[str]:
-    """Estratégia MACD"""
+def macd_crossover_strategy(df: pd.DataFrame) -> Optional[str]:
+    """MACD com múltiplos timeframes"""
     try:
-        macd_line, signal_line = calculate_macd(df)
-        df['MACD'] = macd_line
-        df['SIGNAL'] = signal_line
+        macd, signal, hist = talib.MACD(df['close'], 
+                                        fastperiod=12, 
+                                        slowperiod=26, 
+                                        signalperiod=9)
+        
+        df['MACD'] = macd
+        df['MACD_SIGNAL'] = signal
+        df['MACD_HIST'] = hist
         
         last, prev = df.iloc[-1], df.iloc[-2]
         
-        if prev['MACD'] < prev['SIGNAL'] and last['MACD'] > last['SIGNAL']:
+        # Bullish crossover
+        if (prev['MACD'] < prev['MACD_SIGNAL'] and 
+            last['MACD'] > last['MACD_SIGNAL'] and 
+            last['MACD_HIST'] > 0):
             return 'buy'
-        if prev['MACD'] > prev['SIGNAL'] and last['MACD'] < last['SIGNAL']:
+        
+        # Bearish crossover
+        if (prev['MACD'] > prev['MACD_SIGNAL'] and 
+            last['MACD'] < last['MACD_SIGNAL'] and 
+            last['MACD_HIST'] < 0):
             return 'sell'
-        return None
+            
     except Exception as e:
-        logger.error(f"Erro em MACD: {e}")
-        return None
+        logger.error(f"Erro MACD: {e}")
+    return None
 
-def volume_filter(df: pd.DataFrame, window: int = 20) -> bool:
+def supertrend_strategy(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0) -> Optional[str]:
+    """Estratégia SuperTrend"""
+    try:
+        # Calcula ATR
+        atr = talib.ATR(df['high'], df['low'], df['close'], timeperiod=period)
+        
+        # Calcula bandas SuperTrend
+        hl2 = (df['high'] + df['low']) / 2
+        upper_band = hl2 + (multiplier * atr)
+        lower_band = hl2 - (multiplier * atr)
+        
+        # Inicializa SuperTrend
+        supertrend = pd.Series(index=df.index, dtype=float)
+        trend = pd.Series(index=df.index, dtype=int)  # 1 = uptrend, -1 = downtrend
+        
+        for i in range(1, len(df)):
+            if df['close'].iloc[i] > upper_band.iloc[i-1]:
+                trend.iloc[i] = 1
+                supertrend.iloc[i] = lower_band.iloc[i]
+            elif df['close'].iloc[i] < lower_band.iloc[i-1]:
+                trend.iloc[i] = -1
+                supertrend.iloc[i] = upper_band.iloc[i]
+            else:
+                trend.iloc[i] = trend.iloc[i-1]
+                supertrend.iloc[i] = (lower_band.iloc[i] if trend.iloc[i] == 1 
+                                      else upper_band.iloc[i])
+        
+        # Verifica mudança de tendência
+        last, prev = trend.iloc[-1], trend.iloc[-2]
+        
+        if prev == -1 and last == 1:
+            return 'buy'
+        elif prev == 1 and last == -1:
+            return 'sell'
+            
+    except Exception as e:
+        logger.error(f"Erro SuperTrend: {e}")
+    return None
+
+def ichimoku_strategy(df: pd.DataFrame) -> Optional[str]:
+    """Estratégia Ichimoku Cloud"""
+    try:
+        # Calcula componentes Ichimoku
+        tenkan_sen = (df['high'].rolling(9).max() + df['low'].rolling(9).min()) / 2
+        kijun_sen = (df['high'].rolling(26).max() + df['low'].rolling(26).min()) / 2
+        senkou_span_a = ((tenkan_sen + kijun_sen) / 2).shift(26)
+        senkou_span_b = ((df['high'].rolling(52).max() + df['low'].rolling(52).min()) / 2).shift(26)
+        
+        last_close = df['close'].iloc[-1]
+        
+        # Sinal de compra: preço acima da nuvem e TK crossover
+        if (last_close > senkou_span_a.iloc[-1] and 
+            last_close > senkou_span_b.iloc[-1] and
+            tenkan_sen.iloc[-1] > kijun_sen.iloc[-1] and
+            tenkan_sen.iloc[-2] <= kijun_sen.iloc[-2]):
+            return 'buy'
+        
+        # Sinal de venda: preço abaixo da nuvem e TK crossunder
+        if (last_close < senkou_span_a.iloc[-1] and 
+            last_close < senkou_span_b.iloc[-1] and
+            tenkan_sen.iloc[-1] < kijun_sen.iloc[-1] and
+            tenkan_sen.iloc[-2] >= kijun_sen.iloc[-2]):
+            return 'sell'
+            
+    except Exception as e:
+        logger.error(f"Erro Ichimoku: {e}")
+    return None
+
+def adx_trend_strategy(df: pd.DataFrame, adx_threshold: int = 25) -> Optional[str]:
+    """ADX + DI para identificar força da tendência"""
+    try:
+        adx = talib.ADX(df['high'], df['low'], df['close'], timeperiod=14)
+        plus_di = talib.PLUS_DI(df['high'], df['low'], df['close'], timeperiod=14)
+        minus_di = talib.MINUS_DI(df['high'], df['low'], df['close'], timeperiod=14)
+        
+        last_adx = adx.iloc[-1]
+        last_plus_di = plus_di.iloc[-1]
+        last_minus_di = minus_di.iloc[-1]
+        
+        # Tendência forte de alta
+        if last_adx > adx_threshold and last_plus_di > last_minus_di:
+            # Crossover DI
+            if (plus_di.iloc[-2] <= minus_di.iloc[-2] and 
+                last_plus_di > last_minus_di):
+                return 'buy'
+        
+        # Tendência forte de baixa
+        elif last_adx > adx_threshold and last_minus_di > last_plus_di:
+            # Crossunder DI
+            if (minus_di.iloc[-2] <= plus_di.iloc[-2] and 
+                last_minus_di > last_plus_di):
+                return 'sell'
+                
+    except Exception as e:
+        logger.error(f"Erro ADX: {e}")
+    return None
+
+# =========================
+# ESTRATÉGIAS DE MOMENTUM (5 estratégias)
+# =========================
+def rsi_divergence_strategy(df: pd.DataFrame) -> Optional[str]:
+    """RSI com detecção de divergência"""
+    try:
+        rsi = talib.RSI(df['close'], timeperiod=14)
+        df['RSI'] = rsi
+        
+        # Divergência de alta: preço faz lower low, RSI faz higher low
+        if len(df) >= 20:
+            # Últimos 10 candles para análise
+            prices = df['close'].values[-10:]
+            rsi_values = rsi.values[-10:]
+            
+            # Encontra mínimos locais
+            price_lows = []
+            rsi_lows = []
+            
+            for i in range(1, len(prices)-1):
+                if prices[i] < prices[i-1] and prices[i] < prices[i+1]:
+                    price_lows.append((i, prices[i]))
+                if rsi_values[i] < rsi_values[i-1] and rsi_values[i] < rsi_values[i+1]:
+                    rsi_lows.append((i, rsi_values[i]))
+            
+            # Verifica divergência bullish
+            if len(price_lows) >= 2 and len(rsi_lows) >= 2:
+                if (price_lows[-1][1] < price_lows[-2][1] and 
+                    rsi_lows[-1][1] > rsi_lows[-2][1] and
+                    rsi_values[-1] < 40):  # RSI oversold
+                    return 'buy'
+            
+            # Verifica divergência bearish
+            price_highs = []
+            rsi_highs = []
+            
+            for i in range(1, len(prices)-1):
+                if prices[i] > prices[i-1] and prices[i] > prices[i+1]:
+                    price_highs.append((i, prices[i]))
+                if rsi_values[i] > rsi_values[i-1] and rsi_values[i] > rsi_values[i+1]:
+                    rsi_highs.append((i, rsi_values[i]))
+            
+            if len(price_highs) >= 2 and len(rsi_highs) >= 2:
+                if (price_highs[-1][1] > price_highs[-2][1] and 
+                    rsi_highs[-1][1] < rsi_highs[-2][1] and
+                    rsi_values[-1] > 60):  # RSI overbought
+                    return 'sell'
+        
+        # Sinais básicos de RSI
+        last_rsi = rsi.iloc[-1]
+        if last_rsi < 30:
+            return 'buy'
+        elif last_rsi > 70:
+            return 'sell'
+            
+    except Exception as e:
+        logger.error(f"Erro RSI Divergence: {e}")
+    return None
+
+def stochastic_strategy(df: pd.DataFrame) -> Optional[str]:
+    """Stochastic Oscillator"""
+    try:
+        slowk, slowd = talib.STOCH(df['high'], df['low'], df['close'],
+                                   fastk_period=14, slowk_period=3,
+                                   slowk_matype=0, slowd_period=3, slowd_matype=0)
+        
+        last_k, last_d = slowk.iloc[-1], slowd.iloc[-1]
+        prev_k, prev_d = slowk.iloc[-2], slowd.iloc[-2]
+        
+        # Oversold com crossover bullish
+        if last_k < 20 and last_d < 20 and prev_k <= prev_d and last_k > last_d:
+            return 'buy'
+        
+        # Overbought com crossover bearish
+        if last_k > 80 and last_d > 80 and prev_k >= prev_d and last_k < last_d:
+            return 'sell'
+            
+    except Exception as e:
+        logger.error(f"Erro Stochastic: {e}")
+    return None
+
+def cci_strategy(df: pd.DataFrame) -> Optional[str]:
+    """Commodity Channel Index"""
+    try:
+        cci = talib.CCI(df['high'], df['low'], df['close'], timeperiod=20)
+        last_cci = cci.iloc[-1]
+        prev_cci = cci.iloc[-2]
+        
+        # Saída de zona oversold
+        if prev_cci < -100 and last_cci > -100:
+            return 'buy'
+        
+        # Saída de zona overbought
+        if prev_cci > 100 and last_cci < 100:
+            return 'sell'
+            
+    except Exception as e:
+        logger.error(f"Erro CCI: {e}")
+    return None
+
+def mfi_strategy(df: pd.DataFrame) -> Optional[str]:
+    """Money Flow Index"""
+    try:
+        mfi = talib.MFI(df['high'], df['low'], df['close'], df['volume'], timeperiod=14)
+        last_mfi = mfi.iloc[-1]
+        
+        if last_mfi < 20:
+            return 'buy'
+        elif last_mfi > 80:
+            return 'sell'
+            
+    except Exception as e:
+        logger.error(f"Erro MFI: {e}")
+    return None
+
+def williams_r_strategy(df: pd.DataFrame) -> Optional[str]:
+    """Williams %R"""
+    try:
+        willr = talib.WILLR(df['high'], df['low'], df['close'], timeperiod=14)
+        last_willr = willr.iloc[-1]
+        
+        if last_willr < -80:
+            return 'buy'
+        elif last_willr > -20:
+            return 'sell'
+            
+    except Exception as e:
+        logger.error(f"Erro Williams %R: {e}")
+    return None
+
+# =========================
+# ESTRATÉGIAS DE REVERSÃO (3 estratégias)
+# =========================
+def bollinger_bands_strategy(df: pd.DataFrame) -> Optional[str]:
+    """Bollinger Bands com squeezes"""
+    try:
+        upper, middle, lower = talib.BBANDS(df['close'], 
+                                           timeperiod=20, 
+                                           nbdevup=2, 
+                                           nbdevdn=2, 
+                                           matype=0)
+        
+        last_close = df['close'].iloc[-1]
+        last_upper = upper.iloc[-1]
+        last_lower = lower.iloc[-1]
+        
+        # Squeeze release (bandwidth)
+        bandwidth = (upper - lower) / middle
+        last_bandwidth = bandwidth.iloc[-1]
+        prev_bandwidth = bandwidth.iloc[-2]
+        
+        # Reversão de banda inferior
+        if last_close <= last_lower and last_bandwidth > prev_bandwidth:
+            return 'buy'
+        
+        # Reversão de banda superior
+        if last_close >= last_upper and last_bandwidth > prev_bandwidth:
+            return 'sell'
+            
+    except Exception as e:
+        logger.error(f"Erro Bollinger Bands: {e}")
+    return None
+
+def pivot_points_strategy(df: pd.DataFrame) -> Optional[str]:
+    """Pivot Points clássicos"""
+    try:
+        # Calcula pivô do dia anterior
+        prev_high = df['high'].iloc[-2]
+        prev_low = df['low'].iloc[-2]
+        prev_close = df['close'].iloc[-2]
+        
+        pivot = (prev_high + prev_low + prev_close) / 3
+        r1 = 2 * pivot - prev_low
+        s1 = 2 * pivot - prev_high
+        r2 = pivot + (prev_high - prev_low)
+        s2 = pivot - (prev_high - prev_low)
+        
+        current_price = df['close'].iloc[-1]
+        
+        # Suporte e resistência
+        if current_price <= s1 and df['close'].iloc[-2] > s1:
+            return 'buy'
+        elif current_price >= r1 and df['close'].iloc[-2] < r1:
+            return 'sell'
+            
+    except Exception as e:
+        logger.error(f"Erro Pivot Points: {e}")
+    return None
+
+def support_resistance_strategy(df: pd.DataFrame, lookback: int = 50) -> Optional[str]:
+    """Suporte e Resistência dinâmicos"""
+    try:
+        if len(df) < lookback:
+            return None
+        
+        # Identifica níveis de S/R
+        highs = df['high'].rolling(window=lookback).max()
+        lows = df['low'].rolling(window=lookback).min()
+        
+        current_price = df['close'].iloc[-1]
+        current_high = highs.iloc[-1]
+        current_low = lows.iloc[-1]
+        
+        # Tolerância de 0.5%
+        tolerance = current_price * 0.005
+        
+        # Teste de resistência
+        if abs(current_price - current_high) <= tolerance:
+            # Verifica rejeição
+            if df['close'].iloc[-2] < current_high and df['high'].iloc[-1] >= current_high:
+                return 'sell'
+        
+        # Teste de suporte
+        if abs(current_price - current_low) <= tolerance:
+            # Verifica rejeição
+            if df['close'].iloc[-2] > current_low and df['low'].iloc[-1] <= current_low:
+                return 'buy'
+                
+    except Exception as e:
+        logger.error(f"Erro Support/Resistance: {e}")
+    return None
+
+# =========================
+# ESTRATÉGIAS DE VOLUME (3 estratégias)
+# =========================
+def vwap_strategy(df: pd.DataFrame) -> Optional[str]:
+    """Volume Weighted Average Price"""
+    try:
+        # Calcula VWAP
+        typical_price = (df['high'] + df['low'] + df['close']) / 3
+        vwap = (typical_price * df['volume']).cumsum() / df['volume'].cumsum()
+        
+        last_close = df['close'].iloc[-1]
+        last_vwap = vwap.iloc[-1]
+        prev_close = df['close'].iloc[-2]
+        prev_vwap = vwap.iloc[-2]
+        
+        # Preço cruzando acima do VWAP
+        if prev_close <= prev_vwap and last_close > last_vwap:
+            return 'buy'
+        
+        # Preço cruzando abaixo do VWAP
+        if prev_close >= prev_vwap and last_close < last_vwap:
+            return 'sell'
+            
+    except Exception as e:
+        logger.error(f"Erro VWAP: {e}")
+    return None
+
+def obv_strategy(df: pd.DataFrame) -> Optional[str]:
+    """On-Balance Volume"""
+    try:
+        obv = talib.OBV(df['close'], df['volume'])
+        
+        # Calcula OBV EMA
+        obv_ema = talib.EMA(obv, timeperiod=20)
+        
+        last_obv = obv.iloc[-1]
+        last_obv_ema = obv_ema.iloc[-1]
+        prev_obv = obv.iloc[-2]
+        prev_obv_ema = obv_ema.iloc[-2]
+        
+        # OBV cruzando acima da EMA
+        if prev_obv <= prev_obv_ema and last_obv > last_obv_ema:
+            return 'buy'
+        
+        # OBV cruzando abaixo da EMA
+        if prev_obv >= prev_obv_ema and last_obv < last_obv_ema:
+            return 'sell'
+            
+    except Exception as e:
+        logger.error(f"Erro OBV: {e}")
+    return None
+
+def volume_profile_strategy(df: pd.DataFrame) -> Optional[str]:
+    """Volume Profile simplificado"""
+    try:
+        # Volume acima da média
+        volume_ma = df['volume'].rolling(20).mean()
+        last_volume = df['volume'].iloc[-1]
+        last_volume_ma = volume_ma.iloc[-1]
+        
+        # Price action com volume
+        last_close = df['close'].iloc[-1]
+        prev_close = df['close'].iloc[-2]
+        last_high = df['high'].iloc[-1]
+        last_low = df['low'].iloc[-1]
+        
+        # Volume spike com bullish candle
+        if (last_volume > last_volume_ma * 1.5 and 
+            last_close > prev_close and
+            (last_close - last_low) > (last_high - last_close) * 2):  # Candle com baixa sombra longa
+            return 'buy'
+        
+        # Volume spike com bearish candle
+        if (last_volume > last_volume_ma * 1.5 and 
+            last_close < prev_close and
+            (last_high - last_close) > (last_close - last_low) * 2):  # Candle com alta sombra longa
+            return 'sell'
+            
+    except Exception as e:
+        logger.error(f"Erro Volume Profile: {e}")
+    return None
+
+# =========================
+# ESTRATÉGIAS AVANÇADAS (3 estratégias)
+# =========================
+def fractals_strategy(df: pd.DataFrame) -> Optional[str]:
+    """Fractals de Bill Williams"""
+    try:
+        # Fractal up (5 candles pattern)
+        fractal_up = []
+        for i in range(2, len(df)-2):
+            if (df['high'].iloc[i] > df['high'].iloc[i-2] and
+                df['high'].iloc[i] > df['high'].iloc[i-1] and
+                df['high'].iloc[i] > df['high'].iloc[i+1] and
+                df['high'].iloc[i] > df['high'].iloc[i+2]):
+                fractal_up.append(i)
+        
+        # Fractal down (5 candles pattern)
+        fractal_down = []
+        for i in range(2, len(df)-2):
+            if (df['low'].iloc[i] < df['low'].iloc[i-2] and
+                df['low'].iloc[i] < df['low'].iloc[i-1] and
+                df['low'].iloc[i] < df['low'].iloc[i+1] and
+                df['low'].iloc[i] < df['low'].iloc[i+2]):
+                fractal_down.append(i)
+        
+        if len(fractal_up) >= 2 and len(fractal_down) >= 1:
+            # Último fractal up depois do último fractal down
+            if max(fractal_up) > max(fractal_down):
+                return 'buy'
+        
+        if len(fractal_down) >= 2 and len(fractal_up) >= 1:
+            # Último fractal down depois do último fractal up
+            if max(fractal_down) > max(fractal_up):
+                return 'sell'
+                
+    except Exception as e:
+        logger.error(f"Erro Fractals: {e}")
+    return None
+
+def market_structure_strategy(df: pd.DataFrame) -> Optional[str]:
+    """Análise de estrutura de mercado (MSS)"""
+    try:
+        if len(df) < 30:
+            return None
+        
+        # Identifica máximos e mínimos significativos
+        highs = df['high'].values[-30:]
+        lows = df['low'].values[-30:]
+        
+        # Higher Highs & Higher Lows (Uptrend)
+        hh = all(highs[i] > highs[i-1] for i in range(-5, -1))
+        hl = all(lows[i] > lows[i-1] for i in range(-5, -1))
+        
+        # Lower Highs & Lower Lows (Downtrend)
+        lh = all(highs[i] < highs[i-1] for i in range(-5, -1))
+        ll = all(lows[i] < lows[i-1] for i in range(-5, -1))
+        
+        # Mudança de estrutura
+        if hh and hl:  # Uptrend confirmado
+            # Break de último high
+            if df['close'].iloc[-1] > max(highs[:-1]):
+                return 'buy'
+        
+        elif lh and ll:  # Downtrend confirmado
+            # Break de último low
+            if df['close'].iloc[-1] < min(lows[:-1]):
+                return 'sell'
+                
+    except Exception as e:
+        logger.error(f"Erro Market Structure: {e}")
+    return None
+
+# =========================
+# FILTROS E CONDIÇÕES
+# =========================
+def volume_filter(df: pd.DataFrame) -> bool:
     """Filtro de volume"""
     try:
         current_volume = df['volume'].iloc[-1]
-        avg_volume = df['volume'].rolling(window=window).mean().iloc[-1]
-        return current_volume > avg_volume * 1.2  # Volume 20% acima da média
+        avg_volume = df['volume'].rolling(20).mean().iloc[-1]
+        return current_volume > avg_volume * 1.2
     except:
         return False
 
+def volatility_filter(df: pd.DataFrame, threshold: float = 0.002) -> bool:
+    """Filtro de volatilidade"""
+    try:
+        atr = talib.ATR(df['high'], df['low'], df['close'], timeperiod=14).iloc[-1]
+        current_price = df['close'].iloc[-1]
+        return (atr / current_price) > threshold
+    except:
+        return False
+
+def trend_filter(df: pd.DataFrame) -> str:
+    """Identifica tendência geral"""
+    try:
+        ema50 = talib.EMA(df['close'], timeperiod=50).iloc[-1]
+        ema200 = talib.EMA(df['close'], timeperiod=200).iloc[-1]
+        current_price = df['close'].iloc[-1]
+        
+        if current_price > ema50 > ema200:
+            return 'strong_bull'
+        elif current_price > ema50 and ema50 > ema200:
+            return 'bull'
+        elif current_price < ema50 < ema200:
+            return 'strong_bear'
+        elif current_price < ema50 and ema50 < ema200:
+            return 'bear'
+        else:
+            return 'neutral'
+    except:
+        return 'neutral'
+
 # =========================
-# GERAÇÃO DE SINAL COM CACHE
+# GERAÇÃO DE SINAL
 # =========================
 def is_signal_duplicate(symbol: str, direction: str) -> bool:
-    """Verifica se sinal é duplicado recentemente"""
+    """Verifica se sinal é duplicado"""
     cache_key = f"{symbol}_{direction}"
     current_time = datetime.now()
     
@@ -220,60 +765,94 @@ def is_signal_duplicate(symbol: str, direction: str) -> bool:
         if current_time - last_time < timedelta(minutes=5):
             return True
     
-    # Limpa cache antigo
-    keys_to_delete = []
-    for key, timestamp in signal_cache.items():
-        if current_time - timestamp > timedelta(minutes=10):
-            keys_to_delete.append(key)
-    
-    for key in keys_to_delete:
-        del signal_cache[key]
-    
     signal_cache[cache_key] = current_time
     return False
 
 def generate_signal(df: pd.DataFrame, symbol: str) -> Optional[str]:
-    """Gera sinal baseado em múltiplas estratégias"""
+    """Gera sinal combinando múltiplas estratégias"""
     try:
         if not volume_filter(df):
             return None
         
         # Executa estratégias ativas
         signals = {}
-        if STRATEGIES['ema_vwap']['active']:
-            signals['ema_vwap'] = ema_vwap_strategy(df)
-        if STRATEGIES['rsi_scalping']['active']:
-            signals['rsi_scalping'] = rsi_scalping_strategy(df)
-        if STRATEGIES['macd']['active']:
-            signals['macd'] = macd_strategy(df)
+        strategy_functions = {
+            'ema_crossover': ema_crossover_strategy,
+            'macd_crossover': macd_crossover_strategy,
+            'supertrend': lambda d: supertrend_strategy(d),
+            'ichimoku': ichimoku_strategy,
+            'adx_trend': adx_trend_strategy,
+            'rsi_divergence': rsi_divergence_strategy,
+            'stochastic': stochastic_strategy,
+            'cci': cci_strategy,
+            'mfi': mfi_strategy,
+            'williams_r': williams_r_strategy,
+            'bollinger_bands': bollinger_bands_strategy,
+            'pivot_points': pivot_points_strategy,
+            'support_resistance': lambda d: support_resistance_strategy(d),
+            'vwap': vwap_strategy,
+            'obv': obv_strategy,
+            'volume_profile': volume_profile_strategy,
+            'fractals': fractals_strategy,
+            'market_structure': market_structure_strategy
+        }
         
-        # Contagem ponderada
-        buy_score = 0
-        sell_score = 0
+        for strategy_name, strategy_func in strategy_functions.items():
+            if STRATEGIES[strategy_name]['active']:
+                try:
+                    signals[strategy_name] = strategy_func(df)
+                except Exception as e:
+                    logger.error(f"Erro na estratégia {strategy_name}: {e}")
+                    signals[strategy_name] = None
         
-        for strategy, result in signals.items():
+        # Contagem ponderada por categoria
+        category_scores = {
+            'trend': {'buy': 0, 'sell': 0},
+            'momentum': {'buy': 0, 'sell': 0},
+            'reversal': {'buy': 0, 'sell': 0},
+            'volume': {'buy': 0, 'sell': 0},
+            'advanced': {'buy': 0, 'sell': 0}
+        }
+        
+        for strategy_name, result in signals.items():
             if result:
-                weight = STRATEGIES[strategy]['weight']
+                category = STRATEGIES[strategy_name]['category']
+                weight = STRATEGIES[strategy_name]['weight']
+                
                 if result == 'buy':
-                    buy_score += weight
+                    category_scores[category]['buy'] += weight
                 elif result == 'sell':
-                    sell_score += weight
+                    category_scores[category]['sell'] += weight
         
-        # Determina direção (mínimo 2 estratégias concordando)
-        threshold = 1.5
-        if buy_score >= threshold or sell_score >= threshold:
-            if buy_score > sell_score and not is_signal_duplicate(symbol, 'buy'):
+        # Calcula scores totais
+        total_buy = sum(cat['buy'] for cat in category_scores.values())
+        total_sell = sum(cat['sell'] for cat in category_scores.values())
+        
+        # Verifica consenso entre categorias
+        categories_in_agreement = 0
+        for category, scores in category_scores.items():
+            if scores['buy'] > 0.5 and scores['buy'] > scores['sell']:
+                categories_in_agreement += 1
+            elif scores['sell'] > 0.5 and scores['sell'] > scores['buy']:
+                categories_in_agreement += 1
+        
+        # Determina direção
+        min_categories = 2  # Mínimo de 2 categorias concordando
+        confidence_threshold = 2.5
+        
+        if categories_in_agreement >= min_categories:
+            if total_buy >= confidence_threshold and not is_signal_duplicate(symbol, 'buy'):
                 direction = 'COMPRA'
                 emoji = '🚀'
                 tp_mult = 1.003
                 sl_mult = 0.998
-                confidence = buy_score
-            elif sell_score > buy_score and not is_signal_duplicate(symbol, 'sell'):
+                confidence_score = total_buy
+            elif total_sell >= confidence_threshold and not is_signal_duplicate(symbol, 'sell'):
                 direction = 'VENDA'
                 emoji = '🔻'
                 tp_mult = 0.997
                 sl_mult = 1.002
-                confidence = sell_score
+                confidence_score = total_sell
             else:
                 return None
             
@@ -281,23 +860,38 @@ def generate_signal(df: pd.DataFrame, symbol: str) -> Optional[str]:
             tp = entry * tp_mult
             sl = entry * sl_mult
             
-            # Formata o preço baseado no símbolo
+            # Identifica quais estratégias contribuíram
+            contributing_strategies = []
+            for strategy_name, result in signals.items():
+                if result == direction.lower():
+                    contributing_strategies.append(strategy_name.replace('_', ' ').title())
+            
+            # Formata mensagem
             formatted_entry = format_price(entry, symbol)
             formatted_tp = format_price(tp, symbol)
             formatted_sl = format_price(sl, symbol)
             
             signal_text = (
-                f"{emoji} <b>SCALPING {direction}</b>\n"
+                f"{emoji} <b>SCALPING {direction} - MULTIESTRATÉGIA</b>\n"
                 f"📊 Par: <code>{symbol}</code>\n"
+                f"🏷️ Categoria: {get_pair_category(symbol)}\n"
                 f"💰 Entrada: <b>{formatted_entry}</b>\n"
                 f"🎯 TP: {formatted_tp} (+0.3%)\n"
                 f"🛡️ SL: {formatted_sl} (-0.2%)\n"
-                f"⏰ TF: 1m | 📈 Volume: Ativo\n"
+                f"⏰ TF: 1m | 📈 Volume: Confirmado\n"
+                f"🧮 Estratégias: {len(contributing_strategies)}/{len(signals)}\n"
+                f"📊 Confiança: {confidence_score:.1f}/10.0\n"
+                f"📋 Categorias concordantes: {categories_in_agreement}/5\n"
+                f"🔄 Tendência: {trend_filter(df).replace('_', ' ').title()}\n"
                 f"🕐 Hora: {datetime.now().strftime('%H:%M:%S')}\n"
-                f"✅ Confiança: {confidence:.1f}/3.0"
             )
             
-            # Armazena último sinal
+            # Adiciona estratégias contribuintes (máximo 5)
+            if contributing_strategies:
+                top_strategies = contributing_strategies[:5]
+                signal_text += f"🏆 Top estratégias: {', '.join(top_strategies)}"
+            
+            # Armazena sinal
             signal_data = {
                 'time': datetime.now(),
                 'symbol': symbol,
@@ -305,14 +899,17 @@ def generate_signal(df: pd.DataFrame, symbol: str) -> Optional[str]:
                 'entry': entry,
                 'tp': tp,
                 'sl': sl,
-                'confidence': confidence,
+                'confidence': confidence_score,
+                'strategies_used': len(contributing_strategies),
+                'categories_agreeing': categories_in_agreement,
+                'trend': trend_filter(df),
                 'text': signal_text
             }
             
             last_signals.append(signal_data)
             
-            # Mantém apenas últimos 50 sinais
-            if len(last_signals) > 50:
+            # Mantém apenas últimos 100 sinais
+            if len(last_signals) > 100:
                 last_signals.pop(0)
             
             return signal_text
@@ -323,175 +920,69 @@ def generate_signal(df: pd.DataFrame, symbol: str) -> Optional[str]:
     return None
 
 # =========================
-# LOOP PRINCIPAL COM VALIDAÇÃO
+# SISTEMA DE MONITORAMENTO
 # =========================
 def check_signals():
     """Verifica sinais para todos os pares"""
     if signals_paused:
         return
     
-    logger.info(f"Verificando sinais para {len(PAIRS)} pares...")
+    logger.info(f"Verificando {len(PAIRS)} pares...")
     
+    signals_generated = 0
     for pair in PAIRS:
         try:
             df = get_binance_data(pair)
-            if df is None or len(df) < 50:
-                logger.warning(f"Dados insuficientes para {pair}")
+            if df is None or len(df) < 100:
                 continue
             
             signal = generate_signal(df, pair)
             if signal:
-                logger.info(f"✅ Sinal encontrado para {pair}")
+                logger.info(f"✅ Sinal para {pair}")
                 try:
                     bot.send_message(CHAT_ID, signal)
-                    time.sleep(0.5)  # Delay entre mensagens
+                    signals_generated += 1
+                    time.sleep(0.3)  # Delay para não sobrecarregar API
                 except Exception as e:
-                    logger.error(f"Erro ao enviar mensagem Telegram: {e}")
+                    logger.error(f"Erro Telegram {pair}: {e}")
                     
         except Exception as e:
             logger.error(f"Erro ao processar {pair}: {e}")
+    
+    if signals_generated > 0:
+        logger.info(f"Total de sinais gerados: {signals_generated}")
 
 # =========================
-# COMANDOS TELEGRAM
-# =========================
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    """Comandos do bot no Telegram"""
-    welcome_text = (
-        "🤖 <b>Bot de Scalping Cripto - Dashboard</b>\n\n"
-        "<b>Comandos disponíveis:</b>\n"
-        "📊 /status - Status do sistema\n"
-        "⏸️ /pause - Pausar sinais\n"
-        "▶️ /resume - Retomar sinais\n"
-        "📈 /pairs - Pares monitorados\n"
-        "📋 /signals - Últimos sinais\n"
-        "⚙️ /settings - Configurações\n"
-        "ℹ️ /info - Informações do bot\n\n"
-        "🌐 Dashboard web disponível!"
-    )
-    bot.reply_to(message, welcome_text)
-
-@bot.message_handler(commands=['status'])
-def send_status(message):
-    """Status do bot"""
-    status_emoji = "⏸️" if signals_paused else "🟢"
-    status_text = "PAUSADO" if signals_paused else "ATIVO"
-    uptime = get_uptime()
-    
-    active_strategies = sum(1 for s in STRATEGIES.values() if s['active'])
-    
-    status_message = (
-        f"{status_emoji} <b>STATUS DO SISTEMA</b>\n\n"
-        f"📊 Status: {status_text}\n"
-        f"⏱️ Uptime: {uptime}\n"
-        f"📈 Pares: {len(PAIRS)}\n"
-        f"⚡ Estratégias ativas: {active_strategies}/3\n"
-        f"📋 Sinais hoje: {len(last_signals)}\n"
-        f"🔄 Próxima verificação: {datetime.now().strftime('%H:%M:%S')}"
-    )
-    bot.reply_to(message, status_message)
-
-@bot.message_handler(commands=['pause'])
-def pause_signals(message):
-    """Pausa sinais"""
-    global signals_paused
-    signals_paused = True
-    bot.reply_to(message, "⏸️ <b>Sinais pausados</b>\nO bot parou de gerar novos sinais.")
-
-@bot.message_handler(commands=['resume'])
-def resume_signals(message):
-    """Retoma sinais"""
-    global signals_paused
-    signals_paused = False
-    bot.reply_to(message, "▶️ <b>Sinais retomados</b>\nO bot voltou a gerar sinais.")
-
-@bot.message_handler(commands=['pairs'])
-def list_pairs(message):
-    """Lista pares monitorados"""
-    pairs_list = "\n".join([f"• {pair}" for pair in PAIRS])
-    response = (
-        f"📊 <b>PARES MONITORADOS</b>\n\n"
-        f"Total: {len(PAIRS)} pares\n\n"
-        f"{pairs_list}\n\n"
-        f"Intervalo: 1 minuto\n"
-        f"Exchange: Binance"
-    )
-    bot.reply_to(message, response)
-
-@bot.message_handler(commands=['signals'])
-def list_signals(message):
-    """Lista últimos sinais"""
-    if not last_signals:
-        bot.reply_to(message, "📭 <b>Nenhum sinal gerado ainda</b>")
-        return
-    
-    recent_signals = last_signals[-5:]  # Últimos 5 sinais
-    
-    signals_text = ""
-    for signal in reversed(recent_signals):
-        emoji = "🟢" if signal['direction'] == 'COMPRA' else "🔴"
-        signals_text += f"{emoji} {signal['symbol']} - {signal['direction']} a {format_price(signal['entry'], signal['symbol'])}\n"
-    
-    response = (
-        f"📋 <b>ÚLTIMOS SINAIS</b>\n\n"
-        f"{signals_text}\n"
-        f"Total de sinais: {len(last_signals)}"
-    )
-    bot.reply_to(message, response)
-
-@bot.message_handler(commands=['info'])
-def bot_info(message):
-    """Informações do bot"""
-    info_text = (
-        "🤖 <b>CRYPTO SCALPING BOT</b>\n\n"
-        "<b>Desenvolvimento:</b>\n"
-        "• Estratégias múltiplas\n"
-        "• Filtro de volume\n"
-        "• Sistema de confiança\n"
-        "• Proteção contra duplicados\n\n"
-        "<b>Características:</b>\n"
-        "• Intervalo: 1 minuto\n"
-        "• Alvo: 0.3%\n"
-        "• Stop: 0.2%\n"
-        "• Dashboard web integrado\n\n"
-        "⚠️ <i>Aviso: Este é um bot para sinais educacionais.</i>"
-    )
-    bot.reply_to(message, info_text)
-
-# =========================
-# DASHBOARD FLASK PROFISSIONAL
+# DASHBOARD FLASK EXPANDIDO
 # =========================
 app = Flask(__name__)
 
 @app.route('/')
 def dashboard():
-    """Dashboard profissional com métricas em tempo real"""
-    
-    # Calcula métricas para exibição
+    """Dashboard principal"""
+    # Estatísticas
     total_signals = len(last_signals)
     buy_signals = len([s for s in last_signals if s['direction'] == 'COMPRA'])
     sell_signals = total_signals - buy_signals
     
-    # Sinais de hoje
-    today = datetime.now().date()
-    today_signals = [s for s in last_signals if s['time'].date() == today]
-    
-    # Últimos sinais
-    recent_signals = last_signals[-10:] if len(last_signals) > 10 else last_signals
+    # Sinais recentes
+    recent_signals = last_signals[-20:] if len(last_signals) > 20 else last_signals
     
     # Estratégias ativas
     active_strategies = sum(1 for s in STRATEGIES.values() if s['active'])
     
-    # Tempo de atividade
-    uptime = get_uptime()
+    # Categorias de pares
+    pair_categories = {}
+    for category, pairs in PAIR_CATEGORIES.items():
+        pair_categories[category] = len(pairs)
     
     html_template = """
     <!DOCTYPE html>
-    <html lang="pt-BR">
+    <html>
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Crypto Scalping Bot - Dashboard</title>
+        <title>Crypto Bot - Multi Strategy</title>
         <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
         <style>
             :root {
@@ -500,1013 +991,497 @@ def dashboard():
                 --success: #27ae60;
                 --danger: #e74c3c;
                 --warning: #f39c12;
-                --light: #ecf0f1;
-                --dark: #2c3e50;
-                --gray: #95a5a6;
+                --info: #17a2b8;
             }
-            
-            * {
-                margin: 0;
-                padding: 0;
-                box-sizing: border-box;
-            }
-            
             body {
                 font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
                 background: linear-gradient(135deg, #1a2980, #26d0ce);
                 color: #333;
-                min-height: 100vh;
-            }
-            
-            .dashboard {
-                max-width: 1400px;
-                margin: 0 auto;
+                margin: 0;
                 padding: 20px;
             }
-            
+            .container {
+                max-width: 1600px;
+                margin: 0 auto;
+            }
             .header {
                 background: rgba(255, 255, 255, 0.95);
                 border-radius: 15px;
                 padding: 25px;
                 margin-bottom: 25px;
-                box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                flex-wrap: wrap;
+                box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+                text-align: center;
             }
-            
-            .logo {
-                display: flex;
-                align-items: center;
+            .stats-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
                 gap: 15px;
+                margin-bottom: 25px;
             }
-            
-            .logo-icon {
-                font-size: 2.5rem;
+            .stat-card {
+                background: rgba(255, 255, 255, 0.95);
+                border-radius: 10px;
+                padding: 20px;
+                text-align: center;
+                box-shadow: 0 5px 15px rgba(0,0,0,0.08);
+            }
+            .stat-value {
+                font-size: 2rem;
+                font-weight: bold;
+                margin: 10px 0;
+            }
+            .stat-label {
+                color: #666;
+                font-size: 0.9rem;
+            }
+            .card {
+                background: rgba(255, 255, 255, 0.95);
+                border-radius: 15px;
+                padding: 25px;
+                margin-bottom: 25px;
+                box-shadow: 0 5px 15px rgba(0,0,0,0.08);
+            }
+            .card h2 {
+                color: var(--primary);
+                border-bottom: 2px solid var(--secondary);
+                padding-bottom: 10px;
+                margin-top: 0;
+            }
+            .table {
+                width: 100%;
+                border-collapse: collapse;
+                margin-top: 15px;
+            }
+            .table th {
+                background: #f8f9fa;
+                padding: 12px;
+                text-align: left;
+                font-weight: 600;
+                border-bottom: 2px solid #dee2e6;
+            }
+            .table td {
+                padding: 12px;
+                border-bottom: 1px solid #eee;
+            }
+            .buy-signal {
+                border-left: 4px solid var(--success);
+                background: rgba(39, 174, 96, 0.05);
+            }
+            .sell-signal {
+                border-left: 4px solid var(--danger);
+                background: rgba(231, 76, 60, 0.05);
+            }
+            .badge {
+                display: inline-block;
+                padding: 4px 12px;
+                border-radius: 20px;
+                font-size: 0.8rem;
+                font-weight: 600;
+            }
+            .badge-buy {
+                background: rgba(39, 174, 96, 0.1);
+                color: var(--success);
+            }
+            .badge-sell {
+                background: rgba(231, 76, 60, 0.1);
+                color: var(--danger);
+            }
+            .badge-category {
+                background: rgba(52, 152, 219, 0.1);
                 color: var(--secondary);
             }
-            
-            .logo-text h1 {
-                font-size: 1.8rem;
-                color: var(--primary);
-                margin-bottom: 5px;
-            }
-            
-            .logo-text p {
-                color: var(--gray);
-                font-size: 0.9rem;
-            }
-            
-            .status-badge {
-                display: inline-block;
-                padding: 8px 20px;
-                border-radius: 50px;
-                font-weight: 600;
-                font-size: 0.9rem;
-            }
-            
-            .status-active {
-                background: var(--success);
-                color: white;
-            }
-            
-            .status-paused {
-                background: var(--danger);
-                color: white;
-            }
-            
             .controls {
                 display: flex;
                 gap: 10px;
+                margin: 20px 0;
             }
-            
             .btn {
-                padding: 10px 20px;
+                padding: 12px 24px;
                 border: none;
                 border-radius: 8px;
                 font-weight: 600;
                 cursor: pointer;
-                transition: all 0.3s ease;
-                display: flex;
+                text-decoration: none;
+                display: inline-flex;
                 align-items: center;
                 gap: 8px;
-                text-decoration: none;
             }
-            
-            .btn-pause {
+            .btn-primary {
+                background: var(--secondary);
+                color: white;
+            }
+            .btn-success {
+                background: var(--success);
+                color: white;
+            }
+            .btn-danger {
                 background: var(--danger);
                 color: white;
             }
-            
-            .btn-resume {
-                background: var(--success);
-                color: white;
-            }
-            
-            .btn:hover {
-                transform: translateY(-2px);
-                box-shadow: 0 5px 15px rgba(0, 0, 0, 0.2);
-            }
-            
-            .metrics-grid {
+            .category-grid {
                 display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-                gap: 20px;
-                margin-bottom: 25px;
-            }
-            
-            .metric-card {
-                background: rgba(255, 255, 255, 0.95);
-                border-radius: 12px;
-                padding: 20px;
-                box-shadow: 0 5px 15px rgba(0, 0, 0, 0.08);
-                transition: transform 0.3s ease;
-            }
-            
-            .metric-card:hover {
-                transform: translateY(-5px);
-            }
-            
-            .metric-header {
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                margin-bottom: 15px;
-            }
-            
-            .metric-icon {
-                font-size: 1.8rem;
-                padding: 12px;
-                border-radius: 10px;
-            }
-            
-            .icon-blue { background: #e3f2fd; color: var(--secondary); }
-            .icon-green { background: #e8f5e9; color: var(--success); }
-            .icon-red { background: #ffebee; color: var(--danger); }
-            .icon-orange { background: #fff3e0; color: var(--warning); }
-            
-            .metric-value {
-                font-size: 2.2rem;
-                font-weight: 700;
-                margin-bottom: 5px;
-            }
-            
-            .metric-label {
-                color: var(--gray);
-                font-size: 0.9rem;
-                text-transform: uppercase;
-                letter-spacing: 1px;
-            }
-            
-            .main-content {
-                display: grid;
-                grid-template-columns: 2fr 1fr;
-                gap: 25px;
-            }
-            
-            .signals-card, .pairs-card {
-                background: rgba(255, 255, 255, 0.95);
-                border-radius: 15px;
-                padding: 25px;
-                box-shadow: 0 5px 15px rgba(0, 0, 0, 0.08);
-            }
-            
-            .card-header {
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                margin-bottom: 20px;
-                padding-bottom: 15px;
-                border-bottom: 2px solid var(--light);
-            }
-            
-            .card-title {
-                font-size: 1.4rem;
-                color: var(--primary);
-                display: flex;
-                align-items: center;
-                gap: 10px;
-            }
-            
-            .card-title i {
-                color: var(--secondary);
-            }
-            
-            .signals-table {
-                width: 100%;
-                border-collapse: collapse;
-            }
-            
-            .signals-table th {
-                text-align: left;
-                padding: 12px 15px;
-                background: var(--light);
-                color: var(--dark);
-                font-weight: 600;
-                border-bottom: 2px solid var(--gray);
-            }
-            
-            .signals-table td {
-                padding: 15px;
-                border-bottom: 1px solid #eee;
-            }
-            
-            .signal-buy {
-                border-left: 4px solid var(--success);
-            }
-            
-            .signal-sell {
-                border-left: 4px solid var(--danger);
-            }
-            
-            .signal-direction {
-                display: inline-block;
-                padding: 5px 12px;
-                border-radius: 20px;
-                font-weight: 600;
-                font-size: 0.8rem;
-            }
-            
-            .direction-buy {
-                background: rgba(39, 174, 96, 0.1);
-                color: var(--success);
-            }
-            
-            .direction-sell {
-                background: rgba(231, 76, 60, 0.1);
-                color: var(--danger);
-            }
-            
-            .signal-price {
-                font-weight: 700;
-                font-size: 1.1rem;
-            }
-            
-            .pairs-list {
-                display: flex;
-                flex-wrap: wrap;
-                gap: 10px;
+                grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+                gap: 15px;
                 margin-top: 15px;
             }
-            
-            .pair-badge {
-                background: var(--light);
-                padding: 8px 15px;
-                border-radius: 20px;
-                font-weight: 600;
-                font-size: 0.85rem;
-                display: flex;
-                align-items: center;
-                gap: 5px;
+            .category-item {
+                background: #f8f9fa;
+                padding: 15px;
+                border-radius: 8px;
+                border-left: 4px solid var(--secondary);
             }
-            
-            .pair-badge i {
-                color: var(--secondary);
+            .progress-bar {
+                height: 8px;
+                background: #e9ecef;
+                border-radius: 4px;
+                margin: 10px 0;
+                overflow: hidden;
             }
-            
-            .empty-state {
-                text-align: center;
-                padding: 40px 20px;
-                color: var(--gray);
+            .progress-fill {
+                height: 100%;
+                border-radius: 4px;
             }
-            
-            .empty-state i {
-                font-size: 3rem;
-                margin-bottom: 15px;
-                color: var(--light);
-            }
-            
-            .last-update {
-                text-align: center;
-                margin-top: 30px;
-                color: white;
-                font-size: 0.85rem;
-                opacity: 0.8;
-            }
-            
-            .strategy-status {
-                display: flex;
-                align-items: center;
-                gap: 8px;
-                margin: 5px 0;
-            }
-            
-            .strategy-dot {
-                width: 10px;
-                height: 10px;
-                border-radius: 50%;
-            }
-            
-            .strategy-active {
+            .progress-buy {
                 background: var(--success);
             }
-            
-            .strategy-inactive {
-                background: var(--gray);
-            }
-            
-            @media (max-width: 1024px) {
-                .main-content {
-                    grid-template-columns: 1fr;
-                }
-            }
-            
-            @media (max-width: 768px) {
-                .header {
-                    flex-direction: column;
-                    gap: 20px;
-                    text-align: center;
-                }
-                
-                .logo {
-                    flex-direction: column;
-                }
-                
-                .metrics-grid {
-                    grid-template-columns: 1fr;
-                }
-                
-                .signals-table {
-                    display: block;
-                    overflow-x: auto;
-                }
+            .progress-sell {
+                background: var(--danger);
             }
         </style>
     </head>
     <body>
-        <div class="dashboard">
+        <div class="container">
             <!-- Header -->
             <div class="header">
-                <div class="logo">
-                    <div class="logo-icon">
-                        <i class="fas fa-robot"></i>
-                    </div>
-                    <div class="logo-text">
-                        <h1>Crypto Scalping Bot</h1>
-                        <p>Sistema automatizado de trading para criptomoedas</p>
-                    </div>
-                </div>
-                <div class="status">
-                    <span class="status-badge {{ 'status-active' if not paused else 'status-paused' }}">
-                        <i class="fas fa-{{ 'play' if not paused else 'pause' }}"></i>
-                        {{ 'ATIVO' if not paused else 'PAUSADO' }}
-                    </span>
-                </div>
+                <h1><i class="fas fa-robot"></i> Crypto Bot - Multi Strategy</h1>
+                <p>Monitorando {{ pairs_count }} pares com {{ strategies_count }} estratégias</p>
                 <div class="controls">
                     {% if not paused %}
-                    <a href="/pause" class="btn btn-pause">
-                        <i class="fas fa-pause"></i>
-                        Pausar Bot
+                    <a href="/pause" class="btn btn-danger">
+                        <i class="fas fa-pause"></i> Pausar Bot
                     </a>
                     {% else %}
-                    <a href="/resume" class="btn btn-resume">
-                        <i class="fas fa-play"></i>
-                        Retomar Bot
+                    <a href="/resume" class="btn btn-success">
+                        <i class="fas fa-play"></i> Retomar Bot
                     </a>
                     {% endif %}
-                    <a href="/stats" class="btn" style="background: var(--secondary); color: white;">
-                        <i class="fas fa-chart-bar"></i>
-                        Estatísticas
+                    <a href="/strategies" class="btn btn-primary">
+                        <i class="fas fa-cogs"></i> Estratégias
+                    </a>
+                    <a href="/pairs" class="btn btn-primary">
+                        <i class="fas fa-coins"></i> Pares
                     </a>
                 </div>
             </div>
             
-            <!-- Metrics Grid -->
-            <div class="metrics-grid">
-                <div class="metric-card">
-                    <div class="metric-header">
-                        <div>
-                            <div class="metric-value">{{ pairs_count }}</div>
-                            <div class="metric-label">Pares Monitorados</div>
-                        </div>
-                        <div class="metric-icon icon-blue">
-                            <i class="fas fa-chart-line"></i>
-                        </div>
-                    </div>
-                    <p>Ativos sendo analisados em tempo real</p>
+            <!-- Stats Grid -->
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-label">Pares Ativos</div>
+                    <div class="stat-value">{{ pairs_count }}</div>
                 </div>
-                
-                <div class="metric-card">
-                    <div class="metric-header">
-                        <div>
-                            <div class="metric-value">{{ total_signals }}</div>
-                            <div class="metric-label">Total de Sinais</div>
-                        </div>
-                        <div class="metric-icon icon-green">
-                            <i class="fas fa-bell"></i>
-                        </div>
-                    </div>
-                    <p>Sinais gerados desde o início</p>
+                <div class="stat-card">
+                    <div class="stat-label">Estratégias</div>
+                    <div class="stat-value">{{ strategies_count }}</div>
                 </div>
-                
-                <div class="metric-card">
-                    <div class="metric-header">
-                        <div>
-                            <div class="metric-value">{{ buy_signals }}</div>
-                            <div class="metric-label">Sinais de Compra</div>
-                        </div>
-                        <div class="metric-icon icon-green">
-                            <i class="fas fa-arrow-up"></i>
-                        </div>
-                    </div>
-                    <p>Oportunidades de entrada long identificadas</p>
+                <div class="stat-card">
+                    <div class="stat-label">Sinais Totais</div>
+                    <div class="stat-value">{{ total_signals }}</div>
                 </div>
-                
-                <div class="metric-card">
-                    <div class="metric-header">
-                        <div>
-                            <div class="metric-value">{{ sell_signals }}</div>
-                            <div class="metric-label">Sinais de Venda</div>
-                        </div>
-                        <div class="metric-icon icon-red">
-                            <i class="fas fa-arrow-down"></i>
-                        </div>
+                <div class="stat-card">
+                    <div class="stat-label">Buy/Sell Ratio</div>
+                    <div class="stat-value">{{ buy_signals }}/{{ sell_signals }}</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Uptime</div>
+                    <div class="stat-value">{{ uptime }}</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Status</div>
+                    <div class="stat-value" style="color: {{ 'var(--success)' if not paused else 'var(--danger)' }}">
+                        {{ 'ATIVO' if not paused else 'PAUSADO' }}
                     </div>
-                    <p>Oportunidades de entrada short identificadas</p>
                 </div>
             </div>
             
-            <!-- Main Content -->
-            <div class="main-content">
-                <!-- Signals Table -->
-                <div class="signals-card">
-                    <div class="card-header">
-                        <h2 class="card-title">
-                            <i class="fas fa-history"></i>
-                            Últimos Sinais
-                        </h2>
-                        <span class="metric-label">{{ recent_signals|length }} registros</span>
-                    </div>
-                    
-                    {% if recent_signals %}
-                    <table class="signals-table">
-                        <thead>
-                            <tr>
-                                <th>Horário</th>
-                                <th>Par</th>
-                                <th>Direção</th>
-                                <th>Entrada</th>
-                                <th>Confiança</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {% for signal in recent_signals|reverse %}
-                            <tr class="{{ 'signal-buy' if signal.direction == 'COMPRA' else 'signal-sell' }}">
-                                <td>
-                                    <strong>{{ signal.time.strftime('%H:%M:%S') }}</strong><br>
-                                    <small>{{ signal.time.strftime('%d/%m') }}</small>
-                                </td>
-                                <td>
-                                    <strong>{{ signal.symbol }}</strong><br>
-                                    <small>Binance</small>
-                                </td>
-                                <td>
-                                    <span class="signal-direction {{ 'direction-buy' if signal.direction == 'COMPRA' else 'direction-sell' }}">
-                                        <i class="fas fa-{{ 'arrow-up' if signal.direction == 'COMPRA' else 'arrow-down' }}"></i>
-                                        {{ signal.direction }}
-                                    </span>
-                                </td>
-                                <td>
-                                    <span class="signal-price">
-                                        ${{ format_price(signal.entry, signal.symbol) }}
-                                    </span>
-                                </td>
-                                <td>
-                                    <div style="display: flex; align-items: center; gap: 5px;">
-                                        <div style="
-                                            width: {{ signal.confidence * 20 }}px;
-                                            height: 10px;
-                                            background: {{ 'var(--success)' if signal.confidence >= 2 else 'var(--warning)' }};
-                                            border-radius: 5px;
-                                        "></div>
-                                        <span>{{ "%.1f"|format(signal.confidence) }}</span>
+            <!-- Recent Signals -->
+            <div class="card">
+                <h2><i class="fas fa-history"></i> Sinais Recentes</h2>
+                {% if recent_signals %}
+                <table class="table">
+                    <thead>
+                        <tr>
+                            <th>Hora</th>
+                            <th>Par</th>
+                            <th>Direção</th>
+                            <th>Entrada</th>
+                            <th>Confiança</th>
+                            <th>Estratégias</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for signal in recent_signals|reverse %}
+                        <tr class="{{ 'buy-signal' if signal.direction == 'COMPRA' else 'sell-signal' }}">
+                            <td>{{ signal.time.strftime('%H:%M:%S') }}</td>
+                            <td><strong>{{ signal.symbol }}</strong></td>
+                            <td>
+                                <span class="badge {{ 'badge-buy' if signal.direction == 'COMPRA' else 'badge-sell' }}">
+                                    {{ signal.direction }}
+                                </span>
+                            </td>
+                            <td>${{ format_price(signal.entry, signal.symbol) }}</td>
+                            <td>
+                                <div class="progress-bar">
+                                    <div class="progress-fill {{ 'progress-buy' if signal.direction == 'COMPRA' else 'progress-sell' }}" 
+                                         style="width: {{ (signal.confidence/10)*100 }}%">
                                     </div>
-                                </td>
-                            </tr>
+                                </div>
+                                {{ signal.confidence|round(1) }}/10
+                            </td>
+                            <td>{{ signal.strategies_used }} estratégias</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+                {% else %}
+                <p style="text-align: center; color: #666; padding: 40px;">
+                    <i class="fas fa-inbox" style="font-size: 3rem; color: #ddd;"></i><br>
+                    Nenhum sinal gerado ainda
+                </p>
+                {% endif %}
+            </div>
+            
+            <!-- Categories -->
+            <div class="card">
+                <h2><i class="fas fa-layer-group"></i> Categorias de Pares</h2>
+                <div class="category-grid">
+                    {% for category, count in pair_categories.items() %}
+                    <div class="category-item">
+                        <h3 style="margin: 0 0 10px 0; color: var(--primary);">
+                            {{ category.replace('_', ' ').title() }}
+                        </h3>
+                        <p style="margin: 0; color: #666;">
+                            {{ count }} pares
+                        </p>
+                        <div style="margin-top: 10px; font-size: 0.9rem;">
+                            {% for pair in PAIR_CATEGORIES[category][:5] %}
+                            <span class="badge badge-category" style="margin: 2px;">{{ pair }}</span>
                             {% endfor %}
-                        </tbody>
-                    </table>
-                    {% else %}
-                    <div class="empty-state">
-                        <i class="fas fa-inbox"></i>
-                        <h3>Nenhum sinal gerado ainda</h3>
-                        <p>Os sinais aparecerão aqui quando o bot identificar oportunidades de trading</p>
-                    </div>
-                    {% endif %}
-                </div>
-                
-                <!-- Pairs and Info -->
-                <div class="pairs-card">
-                    <div class="card-header">
-                        <h2 class="card-title">
-                            <i class="fas fa-coins"></i>
-                            Informações do Sistema
-                        </h2>
-                    </div>
-                    
-                    <div style="margin-bottom: 20px;">
-                        <h3 style="margin-bottom: 10px; color: var(--primary);">
-                            <i class="fas fa-cogs"></i>
-                            Configurações
-                        </h3>
-                        <div class="strategy-status">
-                            <div class="strategy-dot {{ 'strategy-active' if strategies_active.ema_vwap else 'strategy-inactive' }}"></div>
-                            <span>EMA+VWAP: {{ 'Ativa' if strategies_active.ema_vwap else 'Inativa' }}</span>
-                        </div>
-                        <div class="strategy-status">
-                            <div class="strategy-dot {{ 'strategy-active' if strategies_active.rsi_scalping else 'strategy-inactive' }}"></div>
-                            <span>RSI Scalping: {{ 'Ativa' if strategies_active.rsi_scalping else 'Inativa' }}</span>
-                        </div>
-                        <div class="strategy-status">
-                            <div class="strategy-dot {{ 'strategy-active' if strategies_active.macd else 'strategy-inactive' }}"></div>
-                            <span>MACD: {{ 'Ativa' if strategies_active.macd else 'Inativa' }}</span>
+                            {% if count > 5 %}
+                            <span style="color: #999;">+{{ count-5 }} mais</span>
+                            {% endif %}
                         </div>
                     </div>
-                    
-                    <div style="margin-bottom: 20px;">
-                        <h3 style="margin-bottom: 10px; color: var(--primary);">
-                            <i class="fas fa-exchange-alt"></i>
-                            Pares Ativos
-                        </h3>
-                        <div class="pairs-list">
-                            {% for pair in pairs %}
-                            <div class="pair-badge">
-                                {% if 'BTC' in pair %}
-                                <i class="fab fa-btc"></i>
-                                {% elif 'ETH' in pair %}
-                                <i class="fab fa-ethereum"></i>
-                                {% else %}
-                                <i class="fas fa-coins"></i>
-                                {% endif %}
-                                {{ pair }}
-                            </div>
-                            {% endfor %}
-                        </div>
-                    </div>
-                    
-                    <div style="padding-top: 20px; border-top: 2px solid var(--light);">
-                        <h3 style="margin-bottom: 10px; color: var(--primary);">
-                            <i class="fas fa-info-circle"></i>
-                            Estatísticas
-                        </h3>
-                        <ul style="list-style: none; padding: 0;">
-                            <li style="margin-bottom: 8px; display: flex; justify-content: space-between;">
-                                <span>Tempo de atividade:</span>
-                                <strong>{{ uptime }}</strong>
-                            </li>
-                            <li style="margin-bottom: 8px; display: flex; justify-content: space-between;">
-                                <span>Sinais hoje:</span>
-                                <strong>{{ today_signals|length }}</strong>
-                            </li>
-                            <li style="margin-bottom: 8px; display: flex; justify-content: space-between;">
-                                <span>Taxa de sucesso:</span>
-                                <strong>{{ "%.1f"|format(success_rate) }}%</strong>
-                            </li>
-                            <li style="margin-bottom: 8px; display: flex; justify-content: space-between;">
-                                <span>Última verificação:</span>
-                                <strong>{{ current_time.strftime('%H:%M:%S') }}</strong>
-                            </li>
-                        </ul>
-                    </div>
+                    {% endfor %}
                 </div>
             </div>
             
             <!-- Footer -->
-            <div class="last-update">
+            <div style="text-align: center; color: white; margin-top: 30px; padding: 20px;">
                 <p>
-                    <i class="fas fa-sync-alt"></i>
-                    Atualização automática em 60s | 
-                    <i class="fas fa-shield-alt"></i>
-                    Sistema operacional desde {{ bot_start_time.strftime('%d/%m/%Y %H:%M') }}
+                    <i class="fas fa-sync-alt"></i> Atualização automática em 60s |
+                    <i class="fas fa-server"></i> Render.com |
+                    <i class="fas fa-code"></i> Python 3.10
+                </p>
+                <p style="font-size: 0.9rem; opacity: 0.8;">
+                    Última atualização: {{ current_time }}
                 </p>
             </div>
         </div>
         
-        <!-- Auto-refresh script -->
         <script>
-            // Auto-refresh a cada 60 segundos
-            setTimeout(function() {
-                location.reload();
-            }, 60000);
+            // Auto-refresh
+            setTimeout(() => location.reload(), 60000);
             
-            // Adiciona confirmação para pausar/retomar
-            document.querySelectorAll('.btn').forEach(button => {
-                if (button.href && button.href.includes('/pause')) {
-                    button.addEventListener('click', function(e) {
-                        if (!confirm('Tem certeza que deseja pausar o bot?')) {
-                            e.preventDefault();
-                        }
-                    });
-                }
-                
-                if (button.href && button.href.includes('/resume')) {
-                    button.addEventListener('click', function(e) {
-                        if (!confirm('Tem certeza que deseja retomar o bot?')) {
-                            e.preventDefault();
-                        }
-                    });
-                }
+            // Confirmações
+            document.querySelectorAll('.btn-danger, .btn-success').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    if (!confirm('Tem certeza?')) e.preventDefault();
+                });
             });
-            
-            // Efeito de realce para novos sinais
-            function highlightNewRows() {
-                const rows = document.querySelectorAll('.signals-table tbody tr');
-                if (rows.length > 0) {
-                    rows[0].style.animation = 'highlight 2s';
-                }
-            }
-            
-            // Adiciona estilo para highlight
-            const style = document.createElement('style');
-            style.textContent = `
-                @keyframes highlight {
-                    0% { background-color: rgba(52, 152, 219, 0.3); }
-                    100% { background-color: transparent; }
-                }
-            `;
-            document.head.appendChild(style);
-            
-            // Executa quando a página carrega
-            document.addEventListener('DOMContentLoaded', highlightNewRows);
-            
-            // Notificação de novo sinal (simulada)
-            function checkForNewSignals() {
-                fetch('/api/signals/count')
-                    .then(response => response.json())
-                    .then(data => {
-                        if (data.count > {{ recent_signals|length }}) {
-                            showNotification('Novo sinal detectado!');
-                        }
-                    });
-            }
-            
-            function showNotification(message) {
-                if (Notification.permission === 'granted') {
-                    new Notification(message);
-                }
-            }
-            
-            // Solicita permissão para notificações
-            if (Notification.permission === 'default') {
-                Notification.requestPermission();
-            }
-            
-            // Verifica novos sinais a cada 30 segundos
-            setInterval(checkForNewSignals, 30000);
         </script>
     </body>
     </html>
     """
     
-    current_time = datetime.now()
-    
-    # Calcula taxa de sucesso (simulada para exemplo)
-    success_rate = 0.0
-    if total_signals > 0:
-        success_rate = (buy_signals / total_signals) * 100
-    
-    # Status das estratégias
-    strategies_active = {
-        'ema_vwap': STRATEGIES['ema_vwap']['active'],
-        'rsi_scalping': STRATEGIES['rsi_scalping']['active'],
-        'macd': STRATEGIES['macd']['active']
-    }
-    
     return render_template_string(
         html_template,
-        recent_signals=recent_signals,
+        pairs_count=len(PAIRS),
+        strategies_count=active_strategies,
         total_signals=total_signals,
         buy_signals=buy_signals,
         sell_signals=sell_signals,
-        today_signals=today_signals,
-        pairs=PAIRS,
-        pairs_count=len(PAIRS),
+        recent_signals=recent_signals,
+        pair_categories=pair_categories,
         paused=signals_paused,
-        current_time=current_time,
-        bot_start_time=bot_start_time,
         uptime=get_uptime(),
-        success_rate=success_rate,
-        strategies_active=strategies_active,
+        current_time=datetime.now().strftime('%H:%M:%S'),
         format_price=format_price
     )
 
-@app.route('/pause')
-def pause_web():
-    """Pausa o bot via web"""
-    global signals_paused
-    signals_paused = True
-    return """
+@app.route('/strategies')
+def strategies_page():
+    """Página de configuração das estratégias"""
+    html = '''
     <!DOCTYPE html>
     <html>
     <head>
         <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Bot Pausado</title>
-        <style>
-            body { 
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                background: linear-gradient(135deg, #1a2980, #26d0ce);
-                display: flex;
-                justify-content: center;
-                align-items: center;
-                height: 100vh;
-                margin: 0;
-            }
-            .message-box {
-                background: white;
-                padding: 40px;
-                border-radius: 15px;
-                text-align: center;
-                box-shadow: 0 10px 30px rgba(0,0,0,0.2);
-            }
-            .icon {
-                font-size: 4rem;
-                color: #e74c3c;
-                margin-bottom: 20px;
-            }
-            h1 {
-                color: #2c3e50;
-                margin-bottom: 10px;
-            }
-            p {
-                color: #7f8c8d;
-                margin-bottom: 30px;
-            }
-            .btn {
-                display: inline-block;
-                padding: 12px 30px;
-                background: #3498db;
-                color: white;
-                text-decoration: none;
-                border-radius: 8px;
-                font-weight: 600;
-                transition: all 0.3s;
-            }
-            .btn:hover {
-                background: #2980b9;
-                transform: translateY(-2px);
-            }
-        </style>
-    </head>
-    <body>
-        <div class="message-box">
-            <div class="icon">
-                <i class="fas fa-pause-circle"></i>
-            </div>
-            <h1>Bot Pausado</h1>
-            <p>O sistema de geração de sinais foi pausado com sucesso.</p>
-            <a href="/" class="btn">Voltar ao Dashboard</a>
-        </div>
-        <script src="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/js/all.min.js"></script>
-    </body>
-    </html>
-    """
-
-@app.route('/resume')
-def resume_web():
-    """Retoma o bot via web"""
-    global signals_paused
-    signals_paused = False
-    return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Bot Retomado</title>
-        <style>
-            body { 
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                background: linear-gradient(135deg, #1a2980, #26d0ce);
-                display: flex;
-                justify-content: center;
-                align-items: center;
-                height: 100vh;
-                margin: 0;
-            }
-            .message-box {
-                background: white;
-                padding: 40px;
-                border-radius: 15px;
-                text-align: center;
-                box-shadow: 0 10px 30px rgba(0,0,0,0.2);
-            }
-            .icon {
-                font-size: 4rem;
-                color: #27ae60;
-                margin-bottom: 20px;
-            }
-            h1 {
-                color: #2c3e50;
-                margin-bottom: 10px;
-            }
-            p {
-                color: #7f8c8d;
-                margin-bottom: 30px;
-            }
-            .btn {
-                display: inline-block;
-                padding: 12px 30px;
-                background: #3498db;
-                color: white;
-                text-decoration: none;
-                border-radius: 8px;
-                font-weight: 600;
-                transition: all 0.3s;
-            }
-            .btn:hover {
-                background: #2980b9;
-                transform: translateY(-2px);
-            }
-        </style>
-    </head>
-    <body>
-        <div class="message-box">
-            <div class="icon">
-                <i class="fas fa-play-circle"></i>
-            </div>
-            <h1>Bot Retomado</h1>
-            <p>O sistema de geração de sinais foi reativado com sucesso.</p>
-            <a href="/" class="btn">Voltar ao Dashboard</a>
-        </div>
-        <script src="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/js/all.min.js"></script>
-    </body>
-    </html>
-    """
-
-@app.route('/stats')
-def statistics():
-    """Página de estatísticas detalhadas"""
-    stats_html = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Estatísticas - Crypto Scalping Bot</title>
-        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+        <title>Configuração de Estratégias</title>
         <style>
             body {
                 font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
                 background: linear-gradient(135deg, #1a2980, #26d0ce);
-                color: white;
+                color: #333;
                 margin: 0;
                 padding: 20px;
             }
             .container {
                 max-width: 1200px;
                 margin: 0 auto;
+                background: rgba(255, 255, 255, 0.95);
+                border-radius: 15px;
+                padding: 30px;
             }
             .back-btn {
                 display: inline-block;
                 margin-bottom: 20px;
                 padding: 10px 20px;
-                background: white;
-                color: #3498db;
+                background: #3498db;
+                color: white;
                 text-decoration: none;
                 border-radius: 8px;
-                font-weight: 600;
             }
-            .stats-grid {
+            .strategy-grid {
                 display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+                grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
                 gap: 20px;
                 margin-top: 20px;
             }
-            .stat-card {
-                background: rgba(255, 255, 255, 0.1);
-                padding: 20px;
+            .strategy-card {
+                background: white;
                 border-radius: 10px;
-                backdrop-filter: blur(10px);
+                padding: 20px;
+                box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+                border-left: 4px solid #3498db;
             }
+            .category-badge {
+                display: inline-block;
+                padding: 4px 12px;
+                border-radius: 20px;
+                font-size: 0.8rem;
+                margin: 5px 0;
+            }
+            .trend { background: #e3f2fd; color: #1976d2; }
+            .momentum { background: #f3e5f5; color: #7b1fa2; }
+            .reversal { background: #e8f5e9; color: #388e3c; }
+            .volume { background: #fff3e0; color: #f57c00; }
+            .advanced { background: #fce4ec; color: #c2185b; }
         </style>
     </head>
     <body>
         <div class="container">
-            <a href="/" class="back-btn">
-                <i class="fas fa-arrow-left"></i> Voltar ao Dashboard
-            </a>
-            <h1><i class="fas fa-chart-bar"></i> Estatísticas Detalhadas</h1>
-            <div class="stats-grid">
-                <div class="stat-card">
-                    <h3><i class="fas fa-robot"></i> Status do Bot</h3>
-                    <p>Uptime: {{ uptime }}</p>
-                    <p>Iniciado em: {{ bot_start_time.strftime('%d/%m/%Y %H:%M:%S') }}</p>
+            <a href="/" class="back-btn">← Voltar</a>
+            <h1>Configuração de Estratégias</h1>
+            <p>Total: {{ total_strategies }} | Ativas: {{ active_strategies }}</p>
+            
+            <form action="/update_strategies" method="post">
+                <div class="strategy-grid">
+                    {% for name, config in strategies.items() %}
+                    <div class="strategy-card">
+                        <h3>{{ name.replace('_', ' ').title() }}</h3>
+                        <span class="category-badge {{ config.category }}">
+                            {{ config.category }}
+                        </span>
+                        <p>Peso: {{ config.weight }}</p>
+                        <label>
+                            <input type="checkbox" name="{{ name }}" {{ 'checked' if config.active }}>
+                            Ativar estratégia
+                        </label>
+                    </div>
+                    {% endfor %}
                 </div>
-                <div class="stat-card">
-                    <h3><i class="fas fa-signal"></i> Sinais</h3>
-                    <p>Total: {{ total_signals }}</p>
-                    <p>Compras: {{ buy_signals }}</p>
-                    <p>Vendas: {{ sell_signals }}</p>
+                
+                <div style="margin-top: 30px; text-align: center;">
+                    <button type="submit" style="padding: 12px 30px; background: #27ae60; color: white; border: none; border-radius: 8px; font-size: 1.1rem;">
+                        Salvar Configurações
+                    </button>
                 </div>
-                <div class="stat-card">
-                    <h3><i class="fas fa-cogs"></i> Configurações</h3>
-                    <p>Pares: {{ pairs_count }}</p>
-                    <p>Estratégias ativas: {{ active_strategies }}/3</p>
-                    <p>Intervalo: 1 minuto</p>
-                </div>
-            </div>
+            </form>
         </div>
     </body>
     </html>
-    """
+    '''
     
     active_strategies = sum(1 for s in STRATEGIES.values() if s['active'])
     
     return render_template_string(
-        stats_html,
-        uptime=get_uptime(),
-        bot_start_time=bot_start_time,
-        total_signals=len(last_signals),
-        buy_signals=len([s for s in last_signals if s['direction'] == 'COMPRA']),
-        sell_signals=len([s for s in last_signals if s['direction'] == 'VENDA']),
-        pairs_count=len(PAIRS),
+        html,
+        strategies=STRATEGIES,
+        total_strategies=len(STRATEGIES),
         active_strategies=active_strategies
     )
 
 # =========================
-# THREADS E EXECUÇÃO
+# FUNÇÕES PRINCIPAIS
 # =========================
 def run_flask():
-    """Executa servidor Flask em thread separada"""
-    logger.info(f"Iniciando servidor Flask na porta 8080...")
-    app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False)
-
-def run_telegram_bot():
-    """Executa polling do Telegram em thread separada"""
-    logger.info("Iniciando bot do Telegram...")
-    try:
-        bot.infinity_polling(timeout=10, long_polling_timeout=5)
-    except Exception as e:
-        logger.error(f"Erro no bot Telegram: {e}")
+    """Executa servidor Flask"""
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 def run_signal_checker():
-    """Executa verificação de sinais periódica"""
+    """Executa verificação periódica de sinais"""
     logger.info("Iniciando verificador de sinais...")
     
-    # Primeira execução imediata
-    check_signals()
-    
-    # Agenda verificação a cada 1 minuto
+    # Verifica a cada 1 minuto
     schedule.every(1).minutes.do(check_signals)
     
     while True:
-        try:
-            schedule.run_pending()
-            time.sleep(1)
-        except Exception as e:
-            logger.error(f"Erro no verificador de sinais: {e}")
-            time.sleep(5)
+        schedule.run_pending()
+        time.sleep(1)
 
 def main():
-    """Função principal para iniciar o sistema"""
-    logger.info("=" * 50)
-    logger.info("INICIANDO CRYPTO SCALPING BOT")
-    logger.info("=" * 50)
-    logger.info(f"Pares monitorados: {len(PAIRS)}")
-    logger.info(f"Estratégias ativas: {sum(1 for s in STRATEGIES.values() if s['active'])}")
-    logger.info(f"Dashboard: http://localhost:8080")
-    logger.info("=" * 50)
+    """Função principal"""
+    logger.info("=" * 60)
+    logger.info("CRYPTO BOT - MULTI STRATEGY")
+    logger.info("=" * 60)
+    logger.info(f"Pares: {len(PAIRS)}")
+    logger.info(f"Estratégias: {sum(1 for s in STRATEGIES.values() if s['active'])}/{len(STRATEGIES)}")
+    logger.info(f"Dashboard: http://localhost:10000")
+    logger.info("=" * 60)
     
+    # Envia mensagem de início
     try:
-        # Envia mensagem de início para o Telegram
         startup_msg = (
-            "🤖 <b>CRYPTO SCALPING BOT INICIADO</b>\n\n"
-            f"⏱️ Hora: {datetime.now().strftime('%H:%M:%S')}\n"
-            f"📊 Pares: {len(PAIRS)}\n"
-            f"⚡ Estratégias: {sum(1 for s in STRATEGIES.values() if s['active'])}/3\n"
-            f"🌐 Dashboard: Disponível\n\n"
-            "✅ Sistema operacional e monitorando mercados..."
+            f"🤖 <b>CRYPTO BOT INICIADO</b>\n\n"
+            f"📊 <b>Configuração:</b>\n"
+            f"• Pares: {len(PAIRS)}\n"
+            f"• Estratégias: {sum(1 for s in STRATEGIES.values() if s['active'])}\n"
+            f"• Categorias: {len(PAIR_CATEGORIES)}\n"
+            f"• Intervalo: 1 minuto\n\n"
+            f"✅ Sistema operacional!"
         )
         bot.send_message(CHAT_ID, startup_msg)
     except Exception as e:
-        logger.error(f"Erro ao enviar mensagem de início: {e}")
+        logger.error(f"Erro ao enviar mensagem inicial: {e}")
     
     # Inicia threads
     flask_thread = threading.Thread(target=run_flask, daemon=True)
-    telegram_thread = threading.Thread(target=run_telegram_bot, daemon=True)
+    signal_thread = threading.Thread(target=run_signal_checker, daemon=True)
     
     flask_thread.start()
-    telegram_thread.start()
+    signal_thread.start()
     
-    # Executa verificador de sinais na thread principal
+    # Mantém thread principal ativa
     try:
-        run_signal_checker()
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
-        logger.info("\nBot encerrado pelo usuário")
-        shutdown_msg = "🛑 <b>Bot encerrado</b>\nSistema desligado pelo usuário."
-        try:
-            bot.send_message(CHAT_ID, shutdown_msg)
-        except:
-            pass
-    except Exception as e:
-        logger.error(f"Erro fatal: {e}")
-        shutdown_msg = f"💥 <b>Erro fatal</b>\n{e}"
-        try:
-            bot.send_message(CHAT_ID, shutdown_msg)
-        except:
-            pass
+        logger.info("Bot encerrado pelo usuário")
 
 if __name__ == "__main__":
+    # Instalação necessária: pip install TA-Lib
+    # Para Linux: sudo apt-get install libta-lib-dev
+    # Para Windows: baixe o .whl apropriado
     main()
