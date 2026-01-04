@@ -23,8 +23,8 @@ last_signals = []
 # =========================
 # CACHE & HISTÓRICO
 # =========================
-indicator_history = {}   # (symbol, timeframe)
-kline_cache = {}         # (symbol, timeframe)
+indicator_history = {}
+kline_cache = {}
 CACHE_TTL = 30
 
 # =========================
@@ -79,44 +79,34 @@ def get_binance_klines(symbol, interval="1m", limit=100):
 def calculate_ema(prices, period):
     if len(prices) < period:
         return prices[-1]
-
     ema = sum(prices[:period]) / period
-    multiplier = 2 / (period + 1)
-
+    mult = 2 / (period + 1)
     for p in prices[period:]:
-        ema = (p - ema) * multiplier + ema
-
+        ema = (p - ema) * mult + ema
     return ema
 
 def calculate_rsi(prices, period=14):
     if len(prices) < period + 1:
         return 50
-
     gains, losses = [], []
     for i in range(1, len(prices)):
         diff = prices[i] - prices[i - 1]
         gains.append(max(diff, 0))
         losses.append(abs(min(diff, 0)))
-
     avg_gain = sum(gains[-period:]) / period
     avg_loss = sum(losses[-period:]) / period
-
     if avg_loss == 0:
         return 100
-
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
 def calculate_stochastic(prices, period=14):
     if len(prices) < period:
         return 50
-
     low = min(prices[-period:])
     high = max(prices[-period:])
-
     if high == low:
         return 50
-
     return (prices[-1] - low) / (high - low) * 100
 
 def calculate_macd(prices):
@@ -135,7 +125,6 @@ def calculate_indicators(prices, volumes, symbol, tf):
         "volume_avg": sum(volumes[-20:]) / 20,
         "prices": prices,
     }
-
     prev = indicator_history.get((symbol, tf))
     indicator_history[(symbol, tf)] = ind
     return ind, prev
@@ -166,10 +155,7 @@ def apply_strategies(ind, prev):
 
     if STRATEGIES["VOLUME_SPIKE"]["active"]:
         if ind["volume"] > ind["volume_avg"] * 3:
-            if prev and ind["price"] > prev["price"]:
-                direction = "COMPRA"
-            else:
-                direction = "VENDA"
+            direction = "COMPRA" if prev and ind["price"] > prev["price"] else "VENDA"
             signals.append((direction, "VOLUME SPIKE", 1.3))
 
     if STRATEGIES["EMA_CROSS"]["active"] and prev:
@@ -189,7 +175,7 @@ def apply_strategies(ind, prev):
     return signals
 
 # =========================
-# ANÁLISE MULTI-TF
+# ANÁLISE MULTI-TIMEFRAME
 # =========================
 def analyze_symbol(symbol):
     buy_score = sell_score = 0
@@ -215,10 +201,8 @@ def analyze_symbol(symbol):
         used_tfs.append(tf)
         for d, r, w in signals:
             reasons.append(f"{tf}: {r}")
-            if d == "COMPRA":
-                buy_score += w
-            else:
-                sell_score += w
+            buy_score += w if d == "COMPRA" else 0
+            sell_score += w if d == "VENDA" else 0
 
     if len(used_tfs) < 2:
         return None
@@ -237,7 +221,6 @@ def analyze_symbol(symbol):
         "confidence": confidence,
         "score": score,
         "reasons": reasons[:3],
-        "timeframes": used_tfs,
         "timestamp": datetime.now(),
     }
 
@@ -266,6 +249,48 @@ def send_signal(signal):
         f"Razões:\n" + "\n".join(signal["reasons"])
     )
     send_telegram(msg)
+    last_signals.append(signal)
+    last_signals[:] = last_signals[-10:]
+
+# =========================
+# DASHBOARD WEB COM IA
+# =========================
+@app.route("/")
+def dashboard():
+    strategies_html = "".join(
+        f"<li>{k} ✅</li>" if v["active"] else f"<li>{k} ❌</li>"
+        for k, v in STRATEGIES.items()
+    )
+
+    signals_html = "".join(
+        f"<div><b>{s['direction']}</b> | {s['symbol']} | {s['confidence']:.0%}</div>"
+        for s in last_signals[::-1]
+    ) or "<p>Nenhum sinal ainda</p>"
+
+    return f"""
+    <html>
+    <head><title>Bot Sinais Cripto</title></head>
+    <body style="background:#020617;color:#e5e7eb;font-family:Arial;padding:30px">
+        <h1>🤖 Bot de Sinais Cripto</h1>
+        <p>Status: Online ✅</p>
+        <p><b>Pares:</b> {', '.join(PAIRS)}</p>
+        <p><b>Timeframes:</b> {', '.join(TIMEFRAMES)}</p>
+
+        <h2>⚙️ Estratégias</h2>
+        <ul>{strategies_html}</ul>
+
+        <h2>🧠 Inteligência Artificial</h2>
+        <p>
+            O bot utiliza um <b>sistema especialista com pontuação adaptativa</b>,
+            combinando múltiplos indicadores, pesos estratégicos,
+            validação multi-timeframe e memória de contexto.
+        </p>
+
+        <h2>📡 Últimos sinais</h2>
+        {signals_html}
+    </body>
+    </html>
+    """
 
 # =========================
 # LOOP PRINCIPAL
