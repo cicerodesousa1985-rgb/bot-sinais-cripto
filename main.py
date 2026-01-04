@@ -182,13 +182,13 @@ def apply_strategies(ind, prev):
         elif ind['ema9'] < ind['ema21'] and prev['ema9'] >= prev['ema21']:
             signals.append(('VENDA', 'EMA DEATH CROSS', 1.3))
 
-    if STRATEGIES['MACD']['active'] and prev:
-        macd = calculate_macd(ind['prices'])
-        prev_macd = calculate_macd(prev['prices'])
-        if macd > 0 and prev_macd <= 0:
-            signals.append(('COMPRA', 'MACD BULLISH', 1.2))
-        elif macd < 0 and prev_macd >= 0:
-            signals.append(('VENDA', 'MACD BEARISH', 1.2))
+    if STRATEGIES['VOLUME_SPIKE']['active']:
+    if ind['volume'] > ind['volume_avg'] * 3:
+        if prev and ind['price'] > prev['price']:
+            direction = 'COMPRA'
+        else:
+            direction = 'VENDA'
+        signals.append((direction, 'VOLUME SPIKE', 1.3))
 
     return signals
 
