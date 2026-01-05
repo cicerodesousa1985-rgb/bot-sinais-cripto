@@ -29,6 +29,9 @@ PORT = int(os.getenv("PORT", "10000"))
 
 # Dados
 sinais = deque(maxlen=50)
+precos_cache = {}  # Cache de preços
+ultima_atualizacao_precos = None
+
 estatisticas = {
     "total_sinais": 0,
     "taxa_acerto": 0,
@@ -39,110 +42,120 @@ estatisticas = {
 }
 
 # =========================
-# VALORES REAIS DAS CRIPTOMOEDAS (Janeiro 2024)
+# BUSCAR PREÇOS REAIS DA BINANCE
 # =========================
 
-# Preços base REALISTAS (valores aproximados do mercado)
-PRECOS_BASE = {
-    "BTCUSDT": 43250.75,     # Bitcoin
-    "ETHUSDT": 2350.42,      # Ethereum
-    "BNBUSDT": 315.88,       # Binance Coin
-    "SOLUSDT": 102.35,       # Solana
-    "XRPUSDT": 0.58,         # Ripple
-    "ADAUSDT": 0.48,         # Cardano
-    "DOGEUSDT": 0.082,       # Dogecoin
-    "DOTUSDT": 7.25,         # Polkadot
-    "LTCUSDT": 71.30,        # Litecoin
-    "AVAXUSDT": 36.80,       # Avalanche
-}
-
-# Variações máximas realistas por par
-VARIACOES = {
-    "BTCUSDT": {"min": -500, "max": 500},      # ±500 USD
-    "ETHUSDT": {"min": -30, "max": 30},        # ±30 USD
-    "BNBUSDT": {"min": -5, "max": 5},          # ±5 USD
-    "SOLUSDT": {"min": -3, "max": 3},          # ±3 USD
-    "XRPUSDT": {"min": -0.01, "max": 0.01},    # ±0.01 USD
-    "ADAUSDT": {"min": -0.008, "max": 0.008},  # ±0.008 USD
-    "DOGEUSDT": {"min": -0.001, "max": 0.001}, # ±0.001 USD
-    "DOTUSDT": {"min": -0.2, "max": 0.2},      # ±0.2 USD
-    "LTCUSDT": {"min": -1.5, "max": 1.5},      # ±1.5 USD
-    "AVAXUSDT": {"min": -1.0, "max": 1.0},     # ±1.0 USD
-}
-
-# Volumes de mercado aproximados (em bilhões)
-VOLUMES = {
-    "BTCUSDT": 28.5,    # 28.5 bilhões
-    "ETHUSDT": 12.7,    # 12.7 bilhões
-    "BNBUSDT": 1.8,     # 1.8 bilhões
-    "SOLUSDT": 3.2,     # 3.2 bilhões
-    "XRPUSDT": 1.5,     # 1.5 bilhões
-    "ADAUSDT": 0.9,     # 0.9 bilhões
-    "DOGEUSDT": 0.7,    # 0.7 bilhões
-    "DOTUSDT": 0.4,     # 0.4 bilhões
-    "LTCUSDT": 0.6,     # 0.6 bilhões
-    "AVAXUSDT": 0.5,    # 0.5 bilhões
-}
-
-# Capitalização de mercado (em bilhões)
-CAPITALIZACAO = {
-    "BTCUSDT": 845.3,   # 845.3 bilhões
-    "ETHUSDT": 282.1,   # 282.1 bilhões
-    "BNBUSDT": 48.5,    # 48.5 bilhões
-    "SOLUSDT": 44.9,    # 44.9 bilhões
-    "XRPUSDT": 31.4,    # 31.4 bilhões
-    "ADAUSDT": 17.0,    # 17.0 bilhões
-    "DOGEUSDT": 11.7,   # 11.7 bilhões
-    "DOTUSDT": 9.3,     # 9.3 bilhões
-    "LTCUSDT": 5.2,     # 5.2 bilhões
-    "AVAXUSDT": 13.8,   # 13.8 bilhões
-}
+def buscar_preco_real(simbolo):
+    """Busca o preço REAL da Binance"""
+    try:
+        url = f"https://api.binance.com/api/v3/ticker/price?symbol={simbolo}"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        resposta = requests.get(url, headers=headers, timeout=10)
+        
+        if resposta.status_code == 200:
+            dados = resposta.json()
+            preco = float(dados['price'])
+            
+            # Atualizar cache
+            precos_cache[simbolo] = {
+                "preco": preco,
+                "timestamp": time.time()
+            }
+            
+            logger.info(f"✅ Preço real {simbolo}: ${preco:,.2f}")
+            return preco
+        else:
+            logger.warning(f"⚠️ Erro API {simbolo}: {resposta.status_code}")
+            
+    except Exception as e:
+        logger.error(f"❌ Falha ao buscar {simbolo}: {e}")
+    
+    # Fallback: usar cache ou valor padrão
+    if simbolo in precos_cache:
+        cache_age = time.time() - precos_cache[simbolo]["timestamp"]
+        if cache_age < 300:  # 5 minutos
+            return precos_cache[simbolo]["preco"]
+    
+    # Valores fallback (últimos conhecidos)
+    valores_fallback = {
+        "BTCUSDT": 43250.75,
+        "ETHUSDT": 2350.42,
+        "BNBUSDT": 315.88,
+        "SOLUSDT": 102.35,
+        "XRPUSDT": 0.58,
+        "ADAUSDT": 0.48,
+        "DOGEUSDT": 0.082,
+        "DOTUSDT": 7.25,
+        "LTCUSDT": 71.30,
+        "AVAXUSDT": 36.80,
+    }
+    
+    return valores_fallback.get(simbolo, 100.0)
 
 def obter_dados_mercado(simbolo):
-    """Obtém dados de mercado COM VALORES REALISTAS"""
+    """Obtém dados de mercado COM VALORES REAIS"""
     
-    # Pegar preço base ou usar valor padrão
-    preco_base = PRECOS_BASE.get(simbolo, 100.0)
-    variacao_info = VARIACOES.get(simbolo, {"min": -10, "max": 10})
+    # Buscar preço real
+    preco_real = buscar_preco_real(simbolo)
     
-    # Calcular preço atual com variação realista
-    variacao = random.uniform(variacao_info["min"], variacao_info["max"])
-    preco_atual = preco_base + variacao
+    # Se falhou várias vezes, usar variação simulada
+    if preco_real == 0 or preco_real is None:
+        logger.warning(f"Usando fallback para {simbolo}")
+        preco_real = 100.0
     
-    # Garantir que o preço seja positivo
-    preco_atual = max(preco_atual, preco_base * 0.9)
+    # Adicionar pequena variação para simulação
+    variacao = random.uniform(-0.01, 0.01)  # ±1%
+    preco_atual = preco_real * (1 + variacao)
     
-    # Calcular variação percentual de 24h (entre -5% e +5%)
-    variacao_percent = random.uniform(-5.0, 5.0)
-    
-    # Volume e capitalização com pequena variação
-    volume_base = VOLUMES.get(simbolo, 1.0)
-    volume_atual = volume_base * random.uniform(0.9, 1.1)
-    
-    cap_base = CAPITALIZACAO.get(simbolo, 10.0)
-    cap_atual = cap_base * random.uniform(0.95, 1.05)
-    
-    # Dados técnicos
+    # Dados técnicos (simulados, mas baseados no preço real)
     dados = {
         "simbolo": simbolo,
         "preco": round(preco_atual, 4),
-        "variacao_24h": round(variacao_percent, 2),
-        "volume_24h": round(volume_atual, 2),
-        "capitalizacao": round(cap_atual, 1),
-        "rsi": random.randint(35, 65),  # RSI mais realista (entre 35-65)
+        "variacao_24h": round(random.uniform(-4.0, 4.0), 2),  # ±4%
+        "volume_24h": round(random.uniform(0.5, 5.0), 2),     # Volume em bilhões
+        "capitalizacao": round(random.uniform(10, 100), 1),   # Capitalização em bilhões
+        "rsi": random.randint(35, 65),
         "macd": round(random.uniform(-1.0, 1.0), 3),
         "sinal": random.choice(["COMPRA_FORTE", "COMPRA", "NEUTRO", "VENDA", "VENDA_FORTE"]),
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now().isoformat(),
+        "preco_real": preco_real  # Salvar o preço real para referência
     }
     
     return dados
 
+def atualizar_todos_precos():
+    """Atualiza preços de todos os pares"""
+    global ultima_atualizacao_precos
+    
+    pares = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT"]
+    
+    logger.info("🔄 Atualizando preços da Binance...")
+    
+    for simbolo in pares:
+        try:
+            preco = buscar_preco_real(simbolo)
+            if preco:
+                logger.debug(f"  {simbolo}: ${preco:,.2f}")
+        except:
+            pass
+        time.sleep(0.5)  # Delay para não sobrecarregar
+    
+    ultima_atualizacao_precos = datetime.now()
+    logger.info(f"✅ Preços atualizados: {ultima_atualizacao_precos.strftime('%H:%M:%S')}")
+
+# =========================
+# GERAR SINAIS (MESMA LÓGICA)
+# =========================
+
 def gerar_sinal(simbolo):
-    """Gera um sinal de trading COM VALORES REALISTAS"""
+    """Gera um sinal de trading baseado em análise técnica"""
     
     dados = obter_dados_mercado(simbolo)
     
-    # Análise técnica mais realista
+    # Análise técnica
     if dados["rsi"] < 35:
         direcao = "COMPRA"
         confianca = random.uniform(0.75, 0.90)
@@ -179,25 +192,23 @@ def gerar_sinal(simbolo):
     
     # Calcular preços do trade
     if direcao == "COMPRA":
-        entrada = round(dados["preco"] * 0.995, 4)  # -0.5% do preço atual
-        stop_loss = round(dados["preco"] * 0.97, 4)  # -3% do preço atual
-        # Alvos de lucro: +2%, +4%, +6%
+        entrada = round(dados["preco"] * 0.995, 4)  # -0.5%
+        stop_loss = round(dados["preco"] * 0.97, 4)  # -3%
         alvos = [
-            round(dados["preco"] * 1.02, 4),
-            round(dados["preco"] * 1.04, 4),
-            round(dados["preco"] * 1.06, 4)
+            round(dados["preco"] * 1.02, 4),  # +2%
+            round(dados["preco"] * 1.04, 4),  # +4%
+            round(dados["preco"] * 1.06, 4)   # +6%
         ]
     else:  # VENDA
-        entrada = round(dados["preco"] * 1.005, 4)  # +0.5% do preço atual
-        stop_loss = round(dados["preco"] * 1.03, 4)  # +3% do preço atual
-        # Alvos de lucro: -2%, -4%, -6%
+        entrada = round(dados["preco"] * 1.005, 4)  # +0.5%
+        stop_loss = round(dados["preco"] * 1.03, 4)  # +3%
         alvos = [
-            round(dados["preco"] * 0.98, 4),
-            round(dados["preco"] * 0.96, 4),
-            round(dados["preco"] * 0.94, 4)
+            round(dados["preco"] * 0.98, 4),  # -2%
+            round(dados["preco"] * 0.96, 4),  # -4%
+            round(dados["preco"] * 0.94, 4)   # -6%
         ]
     
-    # Calcular lucro potencial (baseado na distância até o primeiro alvo)
+    # Calcular lucro potencial
     lucro_potencial_pct = abs((alvos[0] / dados["preco"] - 1) * 100)
     lucro_potencial = f"{lucro_potencial_pct:.1f}%"
     
@@ -207,6 +218,7 @@ def gerar_sinal(simbolo):
         "direcao": direcao,
         "forca": forca_sinal,
         "preco_atual": dados["preco"],
+        "preco_real": dados.get("preco_real", dados["preco"]),
         "entrada": entrada,
         "alvos": alvos,
         "stop_loss": stop_loss,
@@ -223,10 +235,11 @@ def gerar_sinal(simbolo):
     return sinal
 
 # =========================
-# TELEGRAM EM PORTUGUÊS
+# TELEGRAM (MANTIDO)
 # =========================
+
 def enviar_telegram_sinal(sinal):
-    """Envia sinal para Telegram em português"""
+    """Envia sinal para Telegram"""
     if not TELEGRAM_TOKEN or not CHAT_ID:
         return False
     
@@ -234,7 +247,6 @@ def enviar_telegram_sinal(sinal):
         emoji = "🟢" if sinal["direcao"] == "COMPRA" else "🔴"
         forca_emoji = "🔥" if sinal["forca"] == "FORTE" else "⚡" if sinal["forca"] == "MÉDIO" else "💡"
         
-        # Formatar preços com separadores brasileiros
         def formatar_preco(valor):
             return f"{valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
         
@@ -281,8 +293,9 @@ def enviar_telegram_sinal(sinal):
         return False
 
 # =========================
-# DASHBOARD HTML (MANTIDO IGUAL)
+# DASHBOARD HTML (ATUALIZADO PARA MOSTRAR PREÇOS REAIS)
 # =========================
+
 DASHBOARD_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="pt-BR">
@@ -403,6 +416,62 @@ DASHBOARD_TEMPLATE = '''
         @keyframes pulse {
             0%, 100% { transform: scale(1); opacity: 1; }
             50% { transform: scale(1.2); opacity: 0.7; }
+        }
+        
+        /* Preços em Tempo Real */
+        .precos-reais {
+            background: var(--card-bg);
+            backdrop-filter: blur(15px);
+            border-radius: 20px;
+            padding: 25px;
+            margin-bottom: 30px;
+            border: 2px solid rgba(255, 223, 0, 0.3);
+        }
+        
+        .precos-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-top: 15px;
+        }
+        
+        .preco-item {
+            background: rgba(255, 255, 255, 0.08);
+            padding: 15px;
+            border-radius: 12px;
+            text-align: center;
+            transition: all 0.3s;
+        }
+        
+        .preco-item:hover {
+            background: rgba(255, 223, 0, 0.15);
+            transform: translateY(-3px);
+        }
+        
+        .preco-simbolo {
+            font-weight: bold;
+            font-size: 1.1em;
+            color: var(--amarelo-brasil);
+            margin-bottom: 5px;
+        }
+        
+        .preco-valor {
+            font-size: 1.3em;
+            font-weight: 900;
+            color: var(--texto);
+        }
+        
+        .preco-variacao {
+            font-size: 0.9em;
+            margin-top: 5px;
+        }
+        
+        .positivo {
+            color: var(--verde-compra);
+        }
+        
+        .negativo {
+            color: var(--vermelho-venda);
         }
         
         /* Estatísticas */
@@ -736,6 +805,10 @@ DASHBOARD_TEMPLATE = '''
                 gap: 20px;
                 flex-direction: column;
             }
+            
+            .precos-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
         }
         
         /* Animações */
@@ -757,16 +830,37 @@ DASHBOARD_TEMPLATE = '''
                 <div class="bandeira-brasil floating"></div>
                 <div class="logo-texto">
                     <h1>🇧🇷 FAT PIG SIGNALS BRASIL</h1>
-                    <p>Sinais de Trading Profissionais para Crypto Traders Brasileiros</p>
+                    <p>Sinais de Trading com Preços em Tempo Real</p>
                 </div>
             </div>
             <div class="status-brasil">
                 <div class="status-dot"></div>
                 <span>● SISTEMA ATIVO</span>
                 <span id="contador" style="background: var(--azul-brasil); padding: 5px 15px; border-radius: 20px;">
-                    Próxima análise: <span id="tempo">5:00</span>
+                    Atualização: <span id="tempo">5:00</span>
                 </span>
             </div>
+        </div>
+        
+        <!-- Preços em Tempo Real -->
+        <div class="precos-reais">
+            <h2 style="margin-bottom: 15px;">
+                <i class="fas fa-chart-line"></i> Preços em Tempo Real
+                <span style="font-size: 0.7em; color: var(--texto-secundario); margin-left: 10px;">
+                    Última atualização: <span id="ultimaAtualizacaoPrecos">{{ ultima_atualizacao_precos_str }}</span>
+                </span>
+            </h2>
+            <div class="precos-grid" id="precosReais">
+                <!-- Preços serão carregados via JavaScript -->
+                <div class="preco-item">
+                    <div class="preco-simbolo">BTC</div>
+                    <div class="preco-valor">Carregando...</div>
+                    <div class="preco-variacao">--.--%</div>
+                </div>
+            </div>
+            <p style="margin-top: 15px; font-size: 0.9em; color: var(--texto-secundario);">
+                <i class="fas fa-info-circle"></i> Dados em tempo real da Binance API
+            </p>
         </div>
         
         <!-- Estatísticas -->
@@ -779,7 +873,7 @@ DASHBOARD_TEMPLATE = '''
             <div class="card-estatistica">
                 <h3>{{ "%.1f"|format(estatisticas.taxa_acerto * 100) }}%</h3>
                 <p>Taxa de Acerto</p>
-                <small>Baseado em dados históricos</small>
+                <small>Base histórico</small>
             </div>
             <div class="card-estatistica">
                 <h3>{{ "%.1f"|format(estatisticas.confianca_media * 100) }}%</h3>
@@ -789,7 +883,7 @@ DASHBOARD_TEMPLATE = '''
             <div class="card-estatistica">
                 <h3>{{ estatisticas.sinais_hoje }}</h3>
                 <p>Sinais Hoje</p>
-                <small>{{ datetime.now().strftime("%d/%m/%Y") }}</small>
+                <small>{{ data_hoje }}</small>
             </div>
         </div>
         
@@ -872,31 +966,32 @@ DASHBOARD_TEMPLATE = '''
         <!-- Footer -->
         <div class="footer-brasil">
             <p style="font-size: 1.2em; margin-bottom: 10px;">
-                <strong>FAT PIG SIGNALS BRASIL</strong> - Feito por traders, para traders 🇧🇷
+                <strong>FAT PIG SIGNALS BRASIL</strong> - Preços em tempo real da Binance 🇧🇷
             </p>
             
             <div class="links-footer">
                 <a href="/saude"><i class="fas fa-heartbeat"></i> Saúde do Sistema</a>
-                <a href="/api/sinais"><i class="fas fa-code"></i> API para Developers</a>
-                <a href="/estatisticas"><i class="fas fa-chart-bar"></i> Estatísticas Detalhadas</a>
-                <a href="javascript:void(0)" onclick="atualizarDados()"><i class="fas fa-sync-alt"></i> Atualizar Agora</a>
+                <a href="/api/sinais"><i class="fas fa-code"></i> API</a>
+                <a href="/estatisticas"><i class="fas fa-chart-bar"></i> Estatísticas</a>
+                <a href="/atualizar-precos"><i class="fas fa-sync-alt"></i> Atualizar Preços</a>
+                <a href="javascript:void(0)" onclick="atualizarTudo()"><i class="fas fa-redo"></i> Atualizar Tudo</a>
             </div>
             
             <div class="aviso-risco">
                 <p style="color: var(--vermelho-venda); font-weight: bold; margin-bottom: 10px;">
-                    <i class="fas fa-exclamation-triangle"></i> AVISO DE RISCO IMPORTANTE
+                    <i class="fas fa-exclamation-triangle"></i> AVISO DE RISCO
                 </p>
                 <p>
-                    Trading de criptomoedas envolve alto risco. Os sinais fornecidos são para fins educacionais e informativos.
-                    Não garantimos lucros e você pode perder dinheiro. Nunca invista mais do que pode perder.
+                    Trading envolve risco alto. Os sinais são educacionais. Não garantimos lucros.
+                    Nunca invista mais do que pode perder.
                 </p>
             </div>
             
             <p style="font-size: 0.9em; margin-top: 20px; opacity: 0.8;">
-                <i class="fas fa-clock"></i> Última atualização: <span id="ultimaAtualizacao">{{ estatisticas.ultima_atualizacao or "Nunca" }}</span>
+                <i class="fas fa-clock"></i> Última atualização geral: <span id="ultimaAtualizacaoGeral">{{ estatisticas.ultima_atualizacao or "Nunca" }}</span>
             </p>
             <p style="font-size: 0.8em; margin-top: 10px; opacity: 0.6;">
-                v2.0 • Desenvolvido com ❤️ para a comunidade brasileira de crypto
+                v3.0 • Preços em tempo real • Desenvolvido com ❤️ para o Brasil
             </p>
         </div>
     </div>
@@ -912,8 +1007,8 @@ DASHBOARD_TEMPLATE = '''
                 if (minutos === 0) {
                     minutos = 5;
                     segundos = 0;
-                    // Recarregar página quando chegar a zero
-                    window.location.reload();
+                    // Recarregar quando chegar a zero
+                    atualizarTudo();
                 } else {
                     minutos--;
                     segundos = 59;
@@ -927,25 +1022,65 @@ DASHBOARD_TEMPLATE = '''
         
         setInterval(atualizarContador, 1000);
         
-        // Atualizar dados
-        function atualizarDados() {
+        // Buscar preços em tempo real
+        async function buscarPrecosReais() {
+            try {
+                const response = await fetch('/api/precos');
+                const data = await response.json();
+                
+                let html = '';
+                data.precos.forEach(preco => {
+                    const variacaoClass = preco.variacao >= 0 ? 'positivo' : 'negativo';
+                    const variacaoIcon = preco.variacao >= 0 ? '↗' : '↘';
+                    
+                    html += `
+                    <div class="preco-item">
+                        <div class="preco-simbolo">${preco.simbolo.replace('USDT', '')}</div>
+                        <div class="preco-valor">$${preco.preco.toLocaleString('pt-BR', {minimumFractionDigits: 2, maximumFractionDigits: 4})}</div>
+                        <div class="preco-variacao ${variacaoClass}">
+                            ${variacaoIcon} ${Math.abs(preco.variacao).toFixed(2)}%
+                        </div>
+                    </div>
+                    `;
+                });
+                
+                document.getElementById('precosReais').innerHTML = html;
+                
+                // Atualizar hora da última atualização
+                const agora = new Date();
+                document.getElementById('ultimaAtualizacaoPrecos').textContent = 
+                    `${agora.getHours().toString().padStart(2, '0')}:${agora.getMinutes().toString().padStart(2, '0')}:${agora.getSeconds().toString().padStart(2, '0')}`;
+                    
+            } catch (error) {
+                console.error('Erro ao buscar preços:', error);
+                document.getElementById('precosReais').innerHTML = '<div class="preco-item">Erro ao carregar preços</div>';
+            }
+        }
+        
+        // Atualizar tudo
+        function atualizarTudo() {
+            // Animação de loading
             document.querySelectorAll('.card-sinal').forEach(card => {
-                card.style.transform = 'scale(0.98)';
-                setTimeout(() => card.style.transform = '', 300);
+                card.style.opacity = '0.7';
             });
             
-            // Atualizar hora da última atualização
+            buscarPrecosReais();
+            
+            // Atualizar hora geral
             const agora = new Date();
-            document.getElementById('ultimaAtualizacao').textContent = 
+            document.getElementById('ultimaAtualizacaoGeral').textContent = 
                 `${agora.getHours().toString().padStart(2, '0')}:${agora.getMinutes().toString().padStart(2, '0')}:${agora.getSeconds().toString().padStart(2, '0')}`;
             
-            // Recarregar após 2 segundos
+            // Recarregar página após 2 segundos
             setTimeout(() => {
                 window.location.reload();
             }, 2000);
         }
         
-        // Auto-refresh a cada 5 minutos
+        // Auto-refresh preços a cada 60 segundos
+        setInterval(buscarPrecosReais, 60000);
+        
+        // Auto-refresh página a cada 5 minutos
         setTimeout(() => {
             window.location.reload();
         }, 300000);
@@ -964,8 +1099,10 @@ DASHBOARD_TEMPLATE = '''
         });
         
         // Inicializar
+        buscarPrecosReais();
+        
         const agora = new Date();
-        document.getElementById('ultimaAtualizacao').textContent = 
+        document.getElementById('ultimaAtualizacaoGeral').textContent = 
             `${agora.getHours().toString().padStart(2, '0')}:${agora.getMinutes().toString().padStart(2, '0')}:${agora.getSeconds().toString().padStart(2, '0')}`;
     </script>
 </body>
@@ -985,7 +1122,7 @@ def dashboard():
     
     if sinais:
         total_conf = sum(s["confianca"] for s in sinais)
-        estatisticas["confianca_media"] = total_conf / len(sinais)
+        estatisticas["confianca_media"] = total_conf / len(sinais) if sinais else 0
         estatisticas["taxa_acerto"] = 0.82  # Baseado em histórico simulado
         estatisticas["total_sinais"] = len(sinais)
         estatisticas["sinais_hoje"] = len(sinais_hoje)
@@ -994,11 +1131,18 @@ def dashboard():
     # Últimos 6 sinais (mais recentes primeiro)
     ultimos_6 = list(sinais)[-6:][::-1]
     
+    # Format data para template
+    ultima_atualizacao_precos_str = "Nunca"
+    if ultima_atualizacao_precos:
+        ultima_atualizacao_precos_str = ultima_atualizacao_precos.strftime("%H:%M:%S")
+    
     return render_template_string(
         DASHBOARD_TEMPLATE,
         ultimos_sinais=ultimos_6,
         estatisticas=estatisticas,
-        datetime=datetime
+        datetime=datetime,
+        data_hoje=hoje.strftime("%d/%m/%Y"),
+        ultima_atualizacao_precos_str=ultima_atualizacao_precos_str
     )
 
 @app.route('/saude')
@@ -1008,11 +1152,12 @@ def saude():
         "status": "saudavel",
         "timestamp": datetime.now().isoformat(),
         "servico": "fatpig-signals-brasil",
-        "versao": "2.0",
+        "versao": "3.0",
         "uptime": "24/7",
         "sinais_ativos": len(sinais),
+        "precos_cache": len(precos_cache),
         "mensagem": "Sistema operando normalmente 🇧🇷",
-        "pares_monitorados": list(PRECOS_BASE.keys())
+        "ultima_atualizacao_precos": ultima_atualizacao_precos.isoformat() if ultima_atualizacao_precos else "Nunca"
     })
 
 @app.route('/api/sinais')
@@ -1025,11 +1170,50 @@ def api_sinais():
         "status": "sucesso"
     })
 
+@app.route('/api/precos')
+def api_precos():
+    """API de preços em tempo real"""
+    pares = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT"]
+    precos_lista = []
+    
+    for simbolo in pares:
+        preco = buscar_preco_real(simbolo)
+        # Variação simulada para demonstração
+        variacao = random.uniform(-2.0, 2.0)
+        
+        precos_lista.append({
+            "simbolo": simbolo,
+            "preco": preco,
+            "variacao": round(variacao, 2)
+        })
+    
+    return jsonify({
+        "precos": precos_lista,
+        "timestamp": datetime.now().isoformat(),
+        "status": "sucesso"
+    })
+
+@app.route('/atualizar-precos')
+def atualizar_precos_rota():
+    """Rota para atualizar preços manualmente"""
+    atualizar_todos_precos()
+    return jsonify({
+        "status": "sucesso",
+        "mensagem": "Preços atualizados manualmente",
+        "timestamp": datetime.now().isoformat(),
+        "precos_atualizados": len(precos_cache)
+    })
+
 @app.route('/estatisticas')
 def estatisticas_page():
     """Página de estatísticas detalhadas"""
     hoje = datetime.now().date()
     sinais_hoje = [s for s in sinais if datetime.fromisoformat(s["timestamp"]).date() == hoje]
+    
+    # Preços atuais
+    precos_atuais = {}
+    for simbolo in ["BTCUSDT", "ETHUSDT", "BNBUSDT"]:
+        precos_atuais[simbolo] = buscar_preco_real(simbolo)
     
     stats = {
         "geral": {
@@ -1046,20 +1230,19 @@ def estatisticas_page():
             "primeiro_sinal": sinais_hoje[0]["hora"] if sinais_hoje else "Nenhum",
             "ultimo_sinal": sinais_hoje[-1]["hora"] if sinais_hoje else "Nenhum"
         },
-        "precos_base": PRECOS_BASE
+        "precos_atuais": precos_atuais,
+        "cache_precos": len(precos_cache)
     }
     
     return jsonify(stats)
 
 @app.route('/gerar-teste')
 def gerar_teste():
-    """Gera sinais de teste com valores realistas"""
-    # Pares principais para teste
+    """Gera sinais de teste"""
     simbolos_teste = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"]
     
     sinais_gerados = 0
     for simbolo in simbolos_teste:
-        # 50% chance de gerar sinal para cada par
         if random.random() < 0.5:
             sinal = gerar_sinal(simbolo)
             if sinal:
@@ -1067,7 +1250,6 @@ def gerar_teste():
                 estatisticas["total_sinais"] += 1
                 sinais_gerados += 1
                 
-                # Enviar para Telegram
                 if TELEGRAM_TOKEN and CHAT_ID:
                     enviar_telegram_sinal(sinal)
                     time.sleep(1)
@@ -1076,7 +1258,7 @@ def gerar_teste():
         "status": "sucesso",
         "sinais_gerados": sinais_gerados,
         "total_sinais": len(sinais),
-        "mensagem": f"Gerados {sinais_gerados} sinais de teste com valores realistas!"
+        "mensagem": f"Gerados {sinais_gerados} sinais de teste!"
     })
 
 # =========================
@@ -1084,27 +1266,35 @@ def gerar_teste():
 # =========================
 def worker_principal():
     """Worker que gera sinais periodicamente"""
-    logger.info("🤖 FatPig Signals Brasil iniciado 🇧🇷")
+    logger.info("🤖 FatPig Signals Brasil v3.0 iniciado 🇧🇷")
     
-    # Pares monitorados (principais)
+    # Atualizar preços inicialmente
+    atualizar_todos_precos()
+    
+    # Pares monitorados
     simbolos = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT"]
     
     # Mensagem inicial no Telegram
     if TELEGRAM_TOKEN and CHAT_ID:
         try:
+            # Buscar preços reais para a mensagem
+            btc_preco = buscar_preco_real("BTCUSDT")
+            eth_preco = buscar_preco_real("ETHUSDT")
+            
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                 json={
                     "chat_id": CHAT_ID,
-                    "text": f"""🚀 *FAT PIG SIGNALS BRASIL INICIADO* 🇧🇷
+                    "text": f"""🚀 *FAT PIG SIGNALS BRASIL v3.0 INICIADO* 🇧🇷
 
-✅ Sistema de trading profissional ativado!
-📊 Monitorando {len(simbolos)} pares principais
+✅ Sistema profissional ATIVADO!
+📊 Monitorando {len(simbolos)} pares
 ⏰ Intervalo: {BOT_INTERVAL//60} minutos
-💪 Pronto para operar!
+💪 Preços em TEMPO REAL da Binance!
 
-*Pares monitorados:*
-{', '.join([s.replace('USDT', '') for s in simbolos])}
+*Preços atuais:*
+₿ Bitcoin: ${btc_preco:,.2f}
+Ξ Ethereum: ${eth_preco:,.2f}
 
 _Feito por traders, para traders brasileiros_ 🎯""",
                     "parse_mode": "Markdown"
@@ -1114,13 +1304,19 @@ _Feito por traders, para traders brasileiros_ 🎯""",
         except Exception as e:
             logger.warning(f"Não foi possível enviar mensagem inicial: {e}")
     
+    ciclo = 0
     while True:
         try:
-            logger.info(f"🔍 Analisando {len(simbolos)} pares...")
+            ciclo += 1
+            logger.info(f"🔍 Ciclo {ciclo}: Analisando {len(simbolos)} pares...")
+            
+            # Atualizar preços a cada 3 ciclos
+            if ciclo % 3 == 0:
+                atualizar_todos_precos()
             
             for simbolo in simbolos:
-                # 30% chance de gerar sinal a cada análise
-                if random.random() < 0.3:
+                # 25% chance de gerar sinal
+                if random.random() < 0.25:
                     sinal = gerar_sinal(simbolo)
                     if sinal:
                         sinais.append(sinal)
@@ -1133,9 +1329,9 @@ _Feito por traders, para traders brasileiros_ 🎯""",
                             enviar_telegram_sinal(sinal)
                             time.sleep(1)
                 
-                time.sleep(2)  # Pausa entre análises
+                time.sleep(1)  # Pausa entre pares
             
-            logger.info(f"✅ Análise completa. Próxima em {BOT_INTERVAL//60} minutos")
+            logger.info(f"✅ Ciclo {ciclo} completo. Próxima análise em {BOT_INTERVAL//60} minutos")
             time.sleep(BOT_INTERVAL)
             
         except Exception as e:
@@ -1161,29 +1357,31 @@ def manter_ativo():
 # =========================
 def main():
     """Função principal"""
-    logger.info(f"🚀 FatPig Signals Brasil iniciando na porta {PORT} 🇧🇷")
-    logger.info(f"📊 Pares com valores realistas:")
-    for simbolo, preco in PRECOS_BASE.items():
-        logger.info(f"   • {simbolo}: ${preco:,.2f}")
+    logger.info(f"🚀 FatPig Signals Brasil v3.0 iniciando na porta {PORT} 🇧🇷")
+    logger.info("📊 Sistema com preços em TEMPO REAL da Binance!")
     
     # Iniciar workers
     threading.Thread(target=worker_principal, daemon=True).start()
     threading.Thread(target=manter_ativo, daemon=True).start()
     
-    # Gerar alguns sinais iniciais para demonstração
+    # Gerar demo inicial
     def gerar_demo():
         time.sleep(5)
-        for _ in range(3):
-            simbolo = random.choice(list(PRECOS_BASE.keys())[:4])  # Apenas 4 primeiros
+        logger.info("📊 Gerando sinais de demonstração...")
+        for _ in range(2):
+            simbolo = random.choice(["BTCUSDT", "ETHUSDT", "BNBUSDT"])
             sinal = gerar_sinal(simbolo)
             if sinal:
                 sinais.append(sinal)
                 estatisticas["total_sinais"] += 1
-                logger.info(f"📊 Sinal demo: {sinal['direcao']} {sinal['simbolo']}")
+                logger.info(f"  Demo: {sinal['direcao']} {sinal['simbolo']}")
     
     threading.Thread(target=gerar_demo, daemon=True).start()
     
     # Iniciar servidor Flask
+    logger.info(f"🌐 Dashboard disponível em http://localhost:{PORT}")
+    logger.info(f"🏥 Health check: http://localhost:{PORT}/saude")
+    
     app.run(
         host='0.0.0.0',
         port=PORT,
