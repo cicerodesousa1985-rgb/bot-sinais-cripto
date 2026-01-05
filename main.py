@@ -4,891 +4,985 @@ import threading
 import requests
 import logging
 from datetime import datetime, timedelta
-from flask import Flask, jsonify, request
-from functools import wraps
+from flask import Flask, jsonify
 from dotenv import load_dotenv
-import psutil
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections import defaultdict, deque
+from collections import deque, defaultdict
+import json
 
 # =========================
 # CONFIGURAÇÃO
 # =========================
 load_dotenv()
 
-class Config:
-    TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-    CHAT_ID = os.getenv("CHAT_ID")
-    BOT_INTERVAL = int(os.getenv("BOT_INTERVAL", 60))
-    MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", 0.5))
-    ENABLE_WEB = os.getenv("ENABLE_WEB", "true").lower() == "true"
-    API_KEY = os.getenv("API_KEY")
-    MAX_WORKERS = int(os.getenv("MAX_WORKERS", 5))
-    CACHE_TTL = int(os.getenv("CACHE_TTL", 30))
-    FAILURE_THRESHOLD = int(os.getenv("FAILURE_THRESHOLD", 5))
-    RECOVERY_TIMEOUT = int(os.getenv("RECOVERY_TIMEOUT", 60))
+# Configurações
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+BOT_INTERVAL = int(os.getenv("BOT_INTERVAL", 600))  # 10 minutos para cloud
+PORT = int(os.getenv("PORT", 10000))
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 # =========================
-# SETUP DE LOGGING
-# =========================
-def setup_logging():
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-    
-    # Console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    
-    # File handler (rotativo)
-    try:
-        file_handler = logging.handlers.RotatingFileHandler(
-            "bot.log",
-            maxBytes=10*1024*1024,  # 10MB
-            backupCount=5
-        )
-        file_handler.setLevel(logging.DEBUG)
-        
-        # Formatter
-        formatter = logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        )
-        console_handler.setFormatter(formatter)
-        file_handler.setFormatter(formatter)
-        
-        logger.addHandler(console_handler)
-        logger.addHandler(file_handler)
-    except Exception as e:
-        print(f"Erro configurando file handler: {e}")
-        console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-        logger.addHandler(console_handler)
-    
-    return logger
-
-logger = setup_logging()
-
-# =========================
-# CIRCUIT BREAKER
-# =========================
-class CircuitBreaker:
-    def __init__(self, failure_threshold=Config.FAILURE_THRESHOLD, 
-                 recovery_timeout=Config.RECOVERY_TIMEOUT):
-        self.failure_threshold = failure_threshold
-        self.recovery_timeout = recovery_timeout
-        self.failures = 0
-        self.last_failure_time = 0
-        self.state = "CLOSED"
-        self.name = "BinanceAPI"
-    
-    def call(self, func, *args, **kwargs):
-        if self.state == "OPEN":
-            if time.time() - self.last_failure_time > self.recovery_timeout:
-                logger.info(f"{self.name}: Tentando recuperação (HALF_OPEN)")
-                self.state = "HALF_OPEN"
-            else:
-                logger.warning(f"{self.name}: Circuit breaker OPEN - requisição bloqueada")
-                raise Exception(f"Circuit breaker is OPEN for {self.name}")
-        
-        try:
-            result = func(*args, **kwargs)
-            if self.state == "HALF_OPEN":
-                logger.info(f"{self.name}: Recuperado com sucesso (CLOSED)")
-                self.state = "CLOSED"
-                self.failures = 0
-            return result
-        except Exception as e:
-            self.failures += 1
-            self.last_failure_time = time.time()
-            logger.error(f"{self.name}: Falha {self.failures}/{self.failure_threshold}: {e}")
-            
-            if self.failures >= self.failure_threshold:
-                self.state = "OPEN"
-                logger.error(f"{self.name}: Circuit breaker ABERTO após {self.failures} falhas")
-            
-            raise e
-    
-    def get_status(self):
-        return {
-            "state": self.state,
-            "failures": self.failures,
-            "last_failure": self.last_failure_time,
-            "time_since_last_failure": time.time() - self.last_failure_time
-        }
-
-# =========================
-# ALERT MANAGER
-# =========================
-class AlertManager:
-    def __init__(self):
-        self.alerts = defaultdict(list)
-        self.triggered_alerts = deque(maxlen=100)
-    
-    def add_alert(self, symbol, condition_type, threshold, action="telegram"):
-        alert_id = f"{symbol}_{condition_type}_{time.time()}"
-        alert = {
-            "id": alert_id,
-            "symbol": symbol,
-            "condition_type": condition_type,
-            "threshold": threshold,
-            "action": action,
-            "created": datetime.now(),
-            "triggered": False
-        }
-        self.alerts[symbol].append(alert)
-        logger.info(f"Alerta adicionado: {symbol} - {condition_type} > {threshold}")
-        return alert_id
-    
-    def check_alerts(self, symbol, indicators):
-        triggered = []
-        for alert in self.alerts.get(symbol, []):
-            if alert["triggered"]:
-                continue
-                
-            condition_met = False
-            if alert["condition_type"] == "PRICE_ABOVE" and indicators["price"] > alert["threshold"]:
-                condition_met = True
-            elif alert["condition_type"] == "PRICE_BELOW" and indicators["price"] < alert["threshold"]:
-                condition_met = True
-            elif alert["condition_type"] == "RSI_ABOVE" and indicators.get("rsi", 50) > alert["threshold"]:
-                condition_met = True
-            elif alert["condition_type"] == "RSI_BELOW" and indicators.get("rsi", 50) < alert["threshold"]:
-                condition_met = True
-            elif alert["condition_type"] == "VOLUME_SPIKE" and indicators.get("volume", 0) > alert["threshold"]:
-                condition_met = True
-            
-            if condition_met:
-                alert["triggered"] = True
-                alert["triggered_time"] = datetime.now()
-                self.triggered_alerts.append(alert)
-                triggered.append(alert)
-                
-                if alert["action"] == "telegram" and Config.TELEGRAM_TOKEN:
-                    msg = f"🚨 ALERTA: {symbol}\n"
-                    msg += f"Condição: {alert['condition_type']}\n"
-                    msg += f"Valor: {alert['threshold']}\n"
-                    msg += f"Preço atual: ${indicators['price']:.4f}\n"
-                    msg += f"RSI: {indicators.get('rsi', 'N/A'):.1f}"
-                    send_telegram(msg)
-        
-        return triggered
-
-# =========================
-# INICIALIZAÇÃO
+# SETUP
 # =========================
 app = Flask(__name__)
-binance_breaker = CircuitBreaker()
-alert_manager = AlertManager()
 
-signals_paused = False
-last_signals = deque(maxlen=20)
-performance_metrics = {
+# Variáveis globais
+last_signals = deque(maxlen=15)
+kline_cache = {}
+circuit_state = "CLOSED"
+circuit_failures = 0
+last_failure_time = 0
+performance_stats = {
+    "requests_total": 0,
+    "requests_success": 0,
+    "requests_failed": 0,
     "cache_hits": 0,
     "cache_misses": 0,
-    "total_requests": 0,
-    "analysis_times": deque(maxlen=100),
-    "last_scan_time": None,
-    "errors": deque(maxlen=100)
+    "last_scan": None
 }
 
-# =========================
-# CACHE & HISTÓRICO
-# =========================
-indicator_history = {}
-kline_cache = {}
-cache_stats = defaultdict(int)
+# Configurar logging
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # =========================
-# CONFIGURAÇÃO DO BOT
+# CONFIGURAÇÃO DO BOT (OTIMIZADA PARA CLOUD)
 # =========================
-TIMEFRAMES = ["1m", "5m", "15m"]
+TIMEFRAMES = ["15m", "30m"]  # Timeframes maiores para menos requests
+PAIRS = ["BTCUSDT", "ETHUSDT", "BNBUSDT"]  # Apenas 3 pares principais
 
-PAIRS = [
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "AVAXUSDT",
-    "DOGEUSDT", "DOTUSDT", "TRXUSDT", "LINKUSDT", "MATICUSDT", "LTCUSDT"
-]
-
+# Estratégias simplificadas
 STRATEGIES = {
-    "RSI_EXTREME": {"active": True, "weight": 1.2},
-    "STOCH_FAST": {"active": True, "weight": 1.1},
-    "PRICE_BREAKOUT": {"active": True, "weight": 1.4},
-    "VOLUME_SPIKE": {"active": True, "weight": 1.3},
-    "EMA_CROSS": {"active": True, "weight": 1.3},
-    "MACD": {"active": True, "weight": 1.2},
+    "RSI": {"active": True, "weight": 1.5},
+    "PRICE_ACTION": {"active": True, "weight": 1.3},
+    "TREND": {"active": True, "weight": 1.2},
 }
 
 # =========================
-# FUNÇÕES UTILITÁRIAS
+# CIRCUIT BREAKER SIMPLIFICADO
 # =========================
-def calculate_cache_hit_rate():
-    total = performance_metrics["cache_hits"] + performance_metrics["cache_misses"]
-    if total == 0:
-        return 0
-    return performance_metrics["cache_hits"] / total
-
-def calculate_avg_analysis_time():
-    times = list(performance_metrics["analysis_times"])
-    if not times:
-        return 0
-    return sum(times) / len(times)
-
-def calculate_timeframe_agreement(timeframe_signals):
-    if len(timeframe_signals) < 2:
-        return 0
+def check_circuit_breaker():
+    """Verifica se podemos fazer requests"""
+    global circuit_state, circuit_failures, last_failure_time
     
-    buy_votes = sum(1 for tf in timeframe_signals 
-                   if any(s[0] == "COMPRA" for s in tf["signals"]))
-    sell_votes = sum(1 for tf in timeframe_signals 
-                    if any(s[0] == "VENDA" for s in tf["signals"]))
+    if circuit_state == "OPEN":
+        # Verificar se já passou tempo suficiente para tentar recuperação
+        if time.time() - last_failure_time > 300:  # 5 minutos
+            circuit_state = "HALF_OPEN"
+            circuit_failures = 0
+            logger.info("🔄 Circuit breaker em modo HALF_OPEN (tentando recuperação)")
+            return True
+        return False
     
-    total = len(timeframe_signals)
-    return max(buy_votes, sell_votes) / total
+    return True
+
+def update_circuit_breaker(success):
+    """Atualiza estado do circuit breaker"""
+    global circuit_state, circuit_failures, last_failure_time
+    
+    if success:
+        if circuit_state == "HALF_OPEN":
+            circuit_state = "CLOSED"
+            circuit_failures = 0
+            logger.info("✅ Circuit breaker recuperado (CLOSED)")
+    else:
+        circuit_failures += 1
+        last_failure_time = time.time()
+        
+        if circuit_failures >= 5:  # 5 falhas consecutivas
+            circuit_state = "OPEN"
+            logger.error(f"🔴 Circuit breaker ABERTO após {circuit_failures} falhas")
 
 # =========================
-# BINANCE API COM CACHE E CIRCUIT BREAKER
+# FUNÇÕES DE API
 # =========================
-def get_binance_klines(symbol, interval="5m", limit=50):
-    """Busca dados da Binance com cache simples"""
+def get_binance_klines(symbol, interval="15m", limit=30):
+    """Busca dados da Binance com proteção e cache"""
+    
+    # Verificar circuit breaker
+    if not check_circuit_breaker():
+        logger.warning(f"⏸️ Circuit breaker OPEN - pulando {symbol}")
+        return None
+    
     key = f"{symbol}_{interval}"
     
-    # Verificar cache (60 segundos)
+    # Verificar cache (90 segundos)
     if key in kline_cache:
         data, timestamp = kline_cache[key]
-        if time.time() - timestamp < 60:
+        if time.time() - timestamp < 90:
+            performance_stats["cache_hits"] += 1
             return data
+    
+    performance_stats["cache_misses"] += 1
+    performance_stats["requests_total"] += 1
     
     try:
         url = "https://api.binance.com/api/v3/klines"
         params = {
-            "symbol": symbol,
+            "symbol": symbol.upper(),
             "interval": interval,
             "limit": limit
         }
         
-        # ADICIONE ESTES HEADERS:
+        # Headers para evitar bloqueio
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Accept': 'application/json',
+            'Accept-Language': 'en-US,en;q=0.9',
         }
         
+        logger.debug(f"📡 Request: {symbol} {interval}")
         response = requests.get(
             url, 
             params=params, 
-            timeout=15,  # Aumente timeout
-            headers=headers  # Adicione headers
+            headers=headers,
+            timeout=15
         )
         
         if response.status_code == 200:
             data = response.json()
-            kline_cache[key] = (data, time.time())
-            logger.info(f"✅ Dados obtidos: {symbol} {interval}")
-            return data
+            
+            # Validar dados
+            if len(data) > 0:
+                kline_cache[key] = (data, time.time())
+                performance_stats["requests_success"] += 1
+                update_circuit_breaker(True)
+                logger.debug(f"✅ Dados recebidos: {symbol} ({len(data)} candles)")
+                return data
+            else:
+                logger.warning(f"⚠️ Dados vazios para {symbol}")
+                performance_stats["requests_failed"] += 1
+                update_circuit_breaker(False)
+                return None
+                
+        elif response.status_code == 429:  # Too Many Requests
+            logger.error(f"⏰ Rate limit excedido para {symbol}")
+            circuit_state = "OPEN"
+            last_failure_time = time.time()
+            return None
+            
         else:
-            logger.error(f"❌ Erro HTTP {response.status_code} para {symbol}")
+            logger.error(f"❌ HTTP {response.status_code} para {symbol}")
+            performance_stats["requests_failed"] += 1
+            update_circuit_breaker(False)
+            return None
             
     except requests.exceptions.Timeout:
         logger.error(f"⏰ Timeout para {symbol}")
+        performance_stats["requests_failed"] += 1
+        update_circuit_breaker(False)
+        return None
+        
     except requests.exceptions.ConnectionError:
-        logger.error(f"🔌 Erro de conexão para {symbol}")
+        logger.error(f"🔌 Connection error para {symbol}")
+        performance_stats["requests_failed"] += 1
+        update_circuit_breaker(False)
+        return None
+        
     except Exception as e:
-        logger.error(f"⚠️  Erro ao buscar {symbol}: {str(e)[:100]}")
-    
-    return None
+        logger.error(f"⚠️ Erro desconhecido para {symbol}: {str(e)[:100]}")
+        performance_stats["requests_failed"] += 1
+        update_circuit_breaker(False)
+        return None
 
 # =========================
-# INDICADORES
+# INDICADORES SIMPLIFICADOS
 # =========================
-def calculate_ema(prices, period):
-    if len(prices) < period:
-        return prices[-1] if prices else 0
-    ema = sum(prices[:period]) / period
-    mult = 2 / (period + 1)
-    for p in prices[period:]:
-        ema = (p - ema) * mult + ema
-    return ema
-
 def calculate_rsi(prices, period=14):
+    """Calcula RSI"""
     if len(prices) < period + 1:
         return 50
-    gains, losses = [], []
-    for i in range(1, len(prices)):
-        diff = prices[i] - prices[i - 1]
-        gains.append(max(diff, 0))
-        losses.append(abs(min(diff, 0)))
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
+    
+    gains = []
+    losses = []
+    
+    for i in range(1, period + 1):
+        change = prices[-i] - prices[-i-1]
+        if change > 0:
+            gains.append(change)
+            losses.append(0)
+        else:
+            gains.append(0)
+            losses.append(abs(change))
+    
+    avg_gain = sum(gains) / period if gains else 0
+    avg_loss = sum(losses) / period if losses else 0
+    
     if avg_loss == 0:
-        return 100
+        return 100 if avg_gain > 0 else 50
+    
     rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    rsi = 100 - (100 / (1 + rs))
+    return round(rsi, 2)
 
-def calculate_stochastic(prices, period=14):
+def calculate_sma(prices, period=20):
+    """Calcula Simple Moving Average"""
     if len(prices) < period:
-        return 50
-    low = min(prices[-period:])
-    high = max(prices[-period:])
-    if high == low:
-        return 50
-    return (prices[-1] - low) / (high - low) * 100
+        return prices[-1] if prices else 0
+    return sum(prices[-period:]) / period
 
-def calculate_macd(prices):
-    return calculate_ema(prices, 12) - calculate_ema(prices, 26)
-
-def calculate_indicators(prices, volumes, symbol, tf):
-    if len(prices) < 50:
-        return None, None
+def calculate_support_resistance(prices):
+    """Identifica suporte e resistência simples"""
+    if len(prices) < 20:
+        return prices[-1], prices[-1]
     
-    ind = {
-        "price": prices[-1],
-        "ema9": calculate_ema(prices, 9),
-        "ema21": calculate_ema(prices, 21),
-        "rsi": calculate_rsi(prices),
-        "stoch": calculate_stochastic(prices),
-        "recent_high": max(prices[-20:]),
-        "recent_low": min(prices[-20:]),
-        "volume": volumes[-1],
-        "volume_avg": sum(volumes[-20:]) / 20,
-        "prices": prices,
-        "timestamp": datetime.now()
-    }
-    prev = indicator_history.get((symbol, tf))
-    indicator_history[(symbol, tf)] = ind
-    
-    # Verificar alertas
-    alert_manager.check_alerts(symbol, ind)
-    
-    return ind, prev
+    recent = prices[-20:]
+    support = min(recent)
+    resistance = max(recent)
+    return support, resistance
 
 # =========================
-# ESTRATÉGIAS
-# =========================
-def apply_strategies(ind, prev):
-    signals = []
-    
-    if STRATEGIES["RSI_EXTREME"]["active"]:
-        if ind["rsi"] < 30:
-            signals.append(("COMPRA", "RSI OVERSOLD", STRATEGIES["RSI_EXTREME"]["weight"]))
-        elif ind["rsi"] > 70:
-            signals.append(("VENDA", "RSI OVERBOUGHT", STRATEGIES["RSI_EXTREME"]["weight"]))
-    
-    if STRATEGIES["STOCH_FAST"]["active"]:
-        if ind["stoch"] < 20:
-            signals.append(("COMPRA", "STOCH OVERSOLD", STRATEGIES["STOCH_FAST"]["weight"]))
-        elif ind["stoch"] > 80:
-            signals.append(("VENDA", "STOCH OVERBOUGHT", STRATEGIES["STOCH_FAST"]["weight"]))
-    
-    if STRATEGIES["PRICE_BREAKOUT"]["active"]:
-        if ind["price"] > ind["recent_high"]:
-            signals.append(("COMPRA", "BREAKOUT ALTA", STRATEGIES["PRICE_BREAKOUT"]["weight"]))
-        elif ind["price"] < ind["recent_low"]:
-            signals.append(("VENDA", "BREAKDOWN BAIXA", STRATEGIES["PRICE_BREAKOUT"]["weight"]))
-    
-    if STRATEGIES["VOLUME_SPIKE"]["active"]:
-        if ind["volume"] > ind["volume_avg"] * 3:
-            direction = "COMPRA" if prev and ind["price"] > prev["price"] else "VENDA"
-            signals.append((direction, "VOLUME SPIKE", STRATEGIES["VOLUME_SPIKE"]["weight"]))
-    
-    if STRATEGIES["EMA_CROSS"]["active"] and prev:
-        if ind["ema9"] > ind["ema21"] and prev["ema9"] <= prev["ema21"]:
-            signals.append(("COMPRA", "EMA GOLDEN CROSS", STRATEGIES["EMA_CROSS"]["weight"]))
-        elif ind["ema9"] < ind["ema21"] and prev["ema9"] >= prev["ema21"]:
-            signals.append(("VENDA", "EMA DEATH CROSS", STRATEGIES["EMA_CROSS"]["weight"]))
-    
-    if STRATEGIES["MACD"]["active"] and prev:
-        macd = calculate_macd(ind["prices"])
-        prev_macd = calculate_macd(prev["prices"])
-        if macd > 0 and prev_macd <= 0:
-            signals.append(("COMPRA", "MACD BULLISH", STRATEGIES["MACD"]["weight"]))
-        elif macd < 0 and prev_macd >= 0:
-            signals.append(("VENDA", "MACD BEARISH", STRATEGIES["MACD"]["weight"]))
-    
-    return signals
-
-# =========================
-# ANÁLISE MULTI-TIMEFRAME
+# ANÁLISE
 # =========================
 def analyze_symbol(symbol):
-    start_time = time.time()
-    
+    """Analisa um símbolo"""
     try:
-        buy_score = sell_score = 0
-        reasons = []
-        price = None
-        used_tfs = []
-        timeframe_signals = []
+        signals = []
+        current_price = None
+        analysis_data = {}
         
         for tf in TIMEFRAMES:
-            klines = get_binance_klines(symbol, tf, limit=100)
-            if not klines:
+            # Buscar dados
+            klines = get_binance_klines(symbol, tf, 30)
+            if not klines or len(klines) < 15:
                 continue
             
+            # Processar dados
             closes = [float(k[4]) for k in klines]
-            volumes = [float(k[5]) for k in klines]
+            highs = [float(k[2]) for k in klines]
+            lows = [float(k[3]) for k in klines]
             
-            ind, prev = calculate_indicators(closes, volumes, symbol, tf)
-            if ind is None:
-                continue
-                
-            price = ind["price"]
+            current_price = closes[-1]
+            analysis_data[tf] = {
+                "price": current_price,
+                "high": highs[-1],
+                "low": lows[-1]
+            }
             
-            signals = apply_strategies(ind, prev)
-            if signals:
-                used_tfs.append(tf)
-                timeframe_signals.append({
-                    "timeframe": tf,
-                    "signals": signals,
-                    "indicators": ind
-                })
-                
-                for direction, reason, weight in signals:
-                    reasons.append(f"{tf}: {reason}")
-                    if direction == "COMPRA":
-                        buy_score += weight
-                    else:
-                        sell_score += weight
+            # Calcular indicadores
+            rsi = calculate_rsi(closes)
+            sma_20 = calculate_sma(closes, 20)
+            support, resistance = calculate_support_resistance(closes)
+            
+            # Aplicar estratégias
+            if STRATEGIES["RSI"]["active"]:
+                if rsi < 32:
+                    signals.append(("COMPRA", f"RSI {rsi} (sobrevenda)", STRATEGIES["RSI"]["weight"]))
+                elif rsi > 68:
+                    signals.append(("VENDA", f"RSI {rsi} (sobrecompra)", STRATEGIES["RSI"]["weight"]))
+            
+            if STRATEGIES["PRICE_ACTION"]["active"]:
+                if current_price < support * 1.01:  # Próximo do suporte
+                    signals.append(("COMPRA", f"Próximo suporte ${support:.2f}", STRATEGIES["PRICE_ACTION"]["weight"]))
+                elif current_price > resistance * 0.99:  # Próximo da resistência
+                    signals.append(("VENDA", f"Próximo resistência ${resistance:.2f}", STRATEGIES["PRICE_ACTION"]["weight"]))
+            
+            if STRATEGIES["TREND"]["active"] and len(closes) >= 20:
+                sma_10 = calculate_sma(closes, 10)
+                if sma_10 > sma_20 and closes[-1] > sma_10:
+                    signals.append(("COMPRA", f"Tendência alta (SMA10 > SMA20)", STRATEGIES["TREND"]["weight"]))
+                elif sma_10 < sma_20 and closes[-1] < sma_10:
+                    signals.append(("VENDA", f"Tendência baixa (SMA10 < SMA20)", STRATEGIES["TREND"]["weight"]))
         
-        if len(used_tfs) < 2:
-            logger.debug(f"{symbol}: Dados insuficientes em {len(used_tfs)} TF(s)")
+        if not signals or current_price is None:
             return None
         
-        # Verificar concordância entre timeframes
-        if len(timeframe_signals) >= 2:
-            agreement_score = calculate_timeframe_agreement(timeframe_signals)
-            if agreement_score < 0.6:  # 60% de concordância mínima
-                logger.info(f"{symbol}: Concordância baixa ({agreement_score:.0%}) - ignorando")
-                return None
+        # Agregar sinais
+        buy_score = sum(w for d, r, w in signals if d == "COMPRA")
+        sell_score = sum(w for d, r, w in signals if d == "VENDA")
         
-        logger.info(f"{symbol}: Dados OK em {len(used_tfs)} TFs ({', '.join(used_tfs)}). "
-                    f"Buy_score: {buy_score:.1f} | Sell_score: {sell_score:.1f}")
+        if buy_score == 0 and sell_score == 0:
+            return None
         
+        # Determinar direção
         direction = "COMPRA" if buy_score > sell_score else "VENDA"
         score = max(buy_score, sell_score)
-        confidence = min(score / (len(STRATEGIES) * 1.5), 1)  # Normalizar score
         
-        if confidence < Config.MIN_CONFIDENCE:
-            logger.debug(f"{symbol}: Confiança baixa ({confidence:.0%}) - ignorando")
+        # Calcular confiança (0-100%)
+        max_possible_score = sum(s["weight"] for s in STRATEGIES.values() if s["active"]) * len(TIMEFRAMES)
+        confidence = min(score / max_possible_score, 1.0)
+        
+        # Filtrar por confiança mínima
+        if confidence < 0.5:  # 50% mínimo
             return None
         
-        analysis_time = time.time() - start_time
-        performance_metrics["analysis_times"].append(analysis_time)
+        # Coletar razões
+        reasons = [r for d, r, w in signals if d == direction][:3]
         
-        return {
+        signal_data = {
             "symbol": symbol,
             "direction": direction,
-            "price": price,
-            "confidence": confidence,
-            "score": score,
-            "reasons": reasons[:3],
-            "timeframes": used_tfs,
-            "agreement_score": agreement_score if 'agreement_score' in locals() else 0,
-            "timestamp": datetime.now(),
-            "analysis_time": analysis_time
+            "price": round(current_price, 4),
+            "confidence": round(confidence, 2),
+            "score": round(score, 1),
+            "reasons": reasons,
+            "timestamp": datetime.now().strftime("%H:%M:%S"),
+            "date": datetime.now().strftime("%d/%m/%Y"),
+            "analysis_data": analysis_data
         }
         
+        logger.info(f"📊 Sinal: {direction} {symbol} ${current_price:.2f} ({confidence:.0%})")
+        return signal_data
+        
     except Exception as e:
-        logger.error(f"Erro analisando {symbol}: {e}")
-        performance_metrics["errors"].append({
-            "time": datetime.now(),
-            "symbol": symbol,
-            "error": str(e)
-        })
+        logger.error(f"❌ Erro analisando {symbol}: {e}")
         return None
 
 # =========================
 # TELEGRAM
 # =========================
-def send_telegram(msg):
-    if not Config.TELEGRAM_TOKEN or not Config.CHAT_ID:
-        logger.warning("Telegram não configurado (TOKEN ou CHAT_ID ausente)")
+def send_telegram(message):
+    """Envia mensagem para o Telegram"""
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        logger.warning("⚠️ Telegram não configurado")
         return False
     
     try:
-        response = requests.post(
-            f"https://api.telegram.org/bot{Config.TELEGRAM_TOKEN}/sendMessage",
-            json={
-                "chat_id": Config.CHAT_ID,
-                "text": msg,
-                "parse_mode": "Markdown"
-            },
-            timeout=10
-        )
-        response.raise_for_status()
-        logger.info("Mensagem enviada para Telegram")
-        return True
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        data = {
+            "chat_id": CHAT_ID,
+            "text": message,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True
+        }
+        
+        response = requests.post(url, json=data, timeout=10)
+        if response.status_code == 200:
+            logger.debug("✅ Mensagem enviada para Telegram")
+            return True
+        else:
+            logger.error(f"❌ Erro Telegram: {response.status_code}")
+            return False
+            
     except Exception as e:
-        logger.error(f"Erro ao enviar Telegram: {e}")
+        logger.error(f"❌ Falha ao enviar Telegram: {e}")
         return False
 
 def send_signal(signal):
+    """Processa e envia um sinal"""
     emoji = "🚀" if signal["direction"] == "COMPRA" else "🔻"
-    msg = (
-        f"{emoji} *{signal['direction']}*\n"
-        f"Par: `{signal['symbol']}`\n"
-        f"Preço: `${signal['price']:.4f}`\n"
-        f"Confiança: {signal['confidence']:.0%}\n"
-        f"Timeframes: {', '.join(signal['timeframes'])}\n"
-        f"Razões:\n" + "\n".join(f"• {r}" for r in signal["reasons"])
+    direction_emoji = "🟢" if signal["direction"] == "COMPRA" else "🔴"
+    
+    message = (
+        f"{direction_emoji} *{signal['direction']} {signal['symbol']}*\n"
+        f"{emoji} *Preço:* `${signal['price']:,}`\n"
+        f"📊 *Confiança:* {int(signal['confidence'] * 100)}%\n"
+        f"🏆 *Score:* {signal['score']}/10\n"
+        f"⏰ *Horário:* {signal['timestamp']}\n"
+        f"📅 *Data:* {signal['date']}\n\n"
+        f"*Motivos:*\n"
     )
     
-    if send_telegram(msg):
+    for i, reason in enumerate(signal["reasons"], 1):
+        message += f"  {i}. {reason}\n"
+    
+    message += f"\n#CryptoBot #{signal['symbol'].replace('USDT', '')}"
+    
+    if send_telegram(message):
         last_signals.append(signal)
         return True
     return False
 
 # =========================
-# BACKTEST SIMPLES
+# ROTAS WEB
 # =========================
-def backtest_strategy(symbol, days=7):
-    """Backtest simples das estratégias"""
-    logger.info(f"Iniciando backtest para {symbol} ({days} dias)")
-    
-    # Em produção, implementar histórico completo
-    # Esta é uma versão simplificada
-    
-    test_results = {
-        "total_trades": 0,
-        "winning_trades": 0,
-        "losing_trades": 0,
-        "total_return": 0,
-        "max_drawdown": 0,
-        "sharpe_ratio": 0
-    }
-    
-    logger.info(f"Backtest concluído para {symbol}")
-    return test_results
-
-# =========================
-# API ENDPOINTS
-# =========================
-def require_api_key(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if not Config.API_KEY:
-            return f(*args, **kwargs)
-        
-        api_key = request.headers.get('X-API-Key') or request.args.get('api_key')
-        if api_key and api_key == Config.API_KEY:
-            return f(*args, **kwargs)
-        return jsonify({"error": "Unauthorized"}), 401
-    return decorated_function
-
-@app.route("/")
+@app.route('/')
 def dashboard():
-    if not Config.ENABLE_WEB:
-        return jsonify({"status": "Web interface disabled"})
+    """Dashboard principal"""
+    # Estatísticas
+    cache_hit_rate = 0
+    if performance_stats["cache_hits"] + performance_stats["cache_misses"] > 0:
+        cache_hit_rate = (performance_stats["cache_hits"] / 
+                         (performance_stats["cache_hits"] + performance_stats["cache_misses"])) * 100
     
-    strategies_html = "".join(
-        f'<span class="px-3 py-1 rounded-full text-xs font-bold {"bg-green-600" if v["active"] else "bg-red-600"}">'
-        f'{k.replace("_", " ")} (w:{v["weight"]})</span>'
-        for k, v in STRATEGIES.items()
-    )
+    success_rate = 0
+    if performance_stats["requests_total"] > 0:
+        success_rate = (performance_stats["requests_success"] / 
+                       performance_stats["requests_total"]) * 100
     
-    signals_table = ""
-    if last_signals:
-        signals_table = """
-        <table class="w-full table-auto border-collapse">
-            <thead>
-                <tr class="bg-gray-800">
-                    <th class="px-4 py-3 text-left">Direção</th>
-                    <th class="px-4 py-3 text-left">Par</th>
-                    <th class="px-4 py-3 text-right">Preço</th>
-                    <th class="px-4 py-3 text-right">Confiança</th>
-                    <th class="px-4 py-3 text-left">TF</th>
-                    <th class="px-4 py-3 text-right">Horário</th>
-                </tr>
-            </thead>
-            <tbody>
+    # Sinais recentes
+    signals_html = ""
+    for signal in list(last_signals)[-10:]:
+        color_class = "signal-buy" if signal["direction"] == "COMPRA" else "signal-sell"
+        time_ago = ""
+        try:
+            signal_time = datetime.strptime(f"{signal['date']} {signal['timestamp']}", "%d/%m/%Y %H:%M:%S")
+            time_diff = datetime.now() - signal_time
+            if time_diff.total_seconds() < 3600:
+                time_ago = f"{int(time_diff.total_seconds() / 60)} min atrás"
+            elif time_diff.total_seconds() < 86400:
+                time_ago = f"{int(time_diff.total_seconds() / 3600)}h atrás"
+            else:
+                time_ago = signal['timestamp']
+        except:
+            time_ago = signal['timestamp']
+        
+        signals_html += f"""
+        <div class="signal {color_class}">
+            <div class="signal-header">
+                <span class="signal-direction">{signal['direction']}</span>
+                <span class="signal-symbol">{signal['symbol']}</span>
+                <span class="signal-price">${signal['price']:,.2f}</span>
+            </div>
+            <div class="signal-body">
+                <div class="signal-confidence">Confiança: {int(signal['confidence']*100)}%</div>
+                <div class="signal-reasons">{' • '.join(signal['reasons'][:2])}</div>
+                <div class="signal-time">{time_ago}</div>
+            </div>
+        </div>
         """
-        for s in reversed(list(last_signals)[-10:]):
-            emoji = "🟢" if s["direction"] == "COMPRA" else "🔴"
-            color = "text-green-400" if s["direction"] == "COMPRA" else "text-red-400"
-            time_str = s["timestamp"].strftime("%H:%M:%S")
-            tfs = ", ".join(s.get("timeframes", []))
-            signals_table += f"""
-                <tr class="border-b border-gray-700 hover:bg-gray-800 transition">
-                    <td class="px-4 py-3 {color} font-bold">{emoji} {s['direction']}</td>
-                    <td class="px-4 py-3 font-mono">{s['symbol']}</td>
-                    <td class="px-4 py-3 text-right font-mono">${s['price']:,.4f}</td>
-                    <td class="px-4 py-3 text-right">{int(s['confidence']*100)}%</td>
-                    <td class="px-4 py-3 text-sm text-gray-400">{tfs}</td>
-                    <td class="px-4 py-3 text-right text-xs text-gray-500">{time_str}</td>
-                </tr>
-            """
-        signals_table += "</tbody></table>"
-    else:
-        signals_table = '<p class="text-gray-400 text-center py-8">Aguardando primeiros sinais...</p>'
     
-    # Circuit breaker status
-    cb_status = binance_breaker.get_status()
-    cb_state_color = {
-        "CLOSED": "text-green-400",
-        "OPEN": "text-red-400",
-        "HALF_OPEN": "text-yellow-400"
-    }.get(cb_status["state"], "text-gray-400")
+    if not signals_html:
+        signals_html = '<div class="no-signals">⏳ Aguardando primeiros sinais...</div>'
     
-    # Cache stats
-    hit_rate = calculate_cache_hit_rate() * 100
+    # Estratégias ativas
+    strategies_html = ""
+    for name, config in STRATEGIES.items():
+        status_class = "strategy-active" if config["active"] else "strategy-inactive"
+        strategies_html += f'<span class="strategy {status_class}">{name} (w:{config["weight"]})</span>'
     
     return f"""
     <!DOCTYPE html>
-    <html lang="pt-BR" class="bg-gray-900 text-gray-100">
+    <html lang="pt-BR">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>🤖 Bot Sinais Cripto Pro</title>
-        <script src="https://cdn.tailwindcss.com"></script>
-        <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
+        <title>Crypto Trading Bot Pro</title>
         <style>
-            body {{ font-family: 'Segoe UI', sans-serif; }}
-            .blink {{ animation: blink 1s infinite; }}
-            @keyframes blink {{ 50% {{ opacity: 0.5; }} }}
-            .progress-bar {{ 
-                width: 100%; 
-                height: 8px; 
-                background: #374151; 
-                border-radius: 4px;
+            * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+            body {{ 
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: #333;
+                min-height: 100vh;
+                padding: 20px;
+            }}
+            .container {{ 
+                max-width: 1200px; 
+                margin: 0 auto;
+                background: white;
+                border-radius: 20px;
+                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
                 overflow: hidden;
             }}
-            .progress-fill {{ 
-                height: 100%; 
-                background: linear-gradient(90deg, #3B82F6, #8B5CF6);
-                transition: width 0.5s ease;
+            .header {{ 
+                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                color: white;
+                padding: 40px;
+                text-align: center;
+                border-bottom: 5px solid #00d4ff;
+            }}
+            .header h1 {{ 
+                font-size: 2.5em; 
+                margin-bottom: 10px;
+                background: linear-gradient(90deg, #00d4ff, #ff00cc);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+            }}
+            .header p {{ 
+                font-size: 1.2em; 
+                opacity: 0.9;
+                margin-bottom: 20px;
+            }}
+            .status {{ 
+                display: inline-flex;
+                align-items: center;
+                background: rgba(0, 212, 255, 0.1);
+                padding: 10px 20px;
+                border-radius: 50px;
+                font-weight: bold;
+            }}
+            .status.online {{ color: #00ff88; }}
+            .status.blink {{ 
+                animation: blink 1s infinite;
+            }}
+            @keyframes blink {{
+                0%, 100% {{ opacity: 1; }}
+                50% {{ opacity: 0.5; }}
+            }}
+            .stats-grid {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+                gap: 20px;
+                padding: 30px;
+                background: #f8f9fa;
+            }}
+            .stat-card {{
+                background: white;
+                padding: 25px;
+                border-radius: 15px;
+                box-shadow: 0 5px 15px rgba(0,0,0,0.08);
+                text-align: center;
+                transition: transform 0.3s;
+            }}
+            .stat-card:hover {{
+                transform: translateY(-5px);
+            }}
+            .stat-card h3 {{
+                font-size: 2.5em;
+                color: #667eea;
+                margin-bottom: 10px;
+            }}
+            .stat-card p {{
+                color: #666;
+                font-size: 0.9em;
+            }}
+            .circuit-open {{ color: #ff4757; }}
+            .circuit-closed {{ color: #2ed573; }}
+            .circuit-half {{ color: #ffa502; }}
+            .section {{
+                padding: 30px;
+                border-bottom: 1px solid #eee;
+            }}
+            .section-title {{
+                font-size: 1.5em;
+                color: #333;
+                margin-bottom: 20px;
+                display: flex;
+                align-items: center;
+                gap: 10px;
+            }}
+            .strategies {{
+                display: flex;
+                flex-wrap: wrap;
+                gap: 10px;
+            }}
+            .strategy {{
+                padding: 8px 16px;
+                border-radius: 20px;
+                font-size: 0.9em;
+                font-weight: 600;
+            }}
+            .strategy-active {{
+                background: #d4edda;
+                color: #155724;
+                border: 2px solid #c3e6cb;
+            }}
+            .strategy-inactive {{
+                background: #f8d7da;
+                color: #721c24;
+                border: 2px solid #f5c6cb;
+            }}
+            .signals-container {{
+                max-height: 500px;
+                overflow-y: auto;
+                padding-right: 10px;
+            }}
+            .signal {{
+                background: white;
+                border-radius: 12px;
+                padding: 20px;
+                margin-bottom: 15px;
+                box-shadow: 0 3px 10px rgba(0,0,0,0.08);
+                border-left: 5px solid;
+                transition: all 0.3s;
+            }}
+            .signal:hover {{
+                box-shadow: 0 5px 20px rgba(0,0,0,0.15);
+            }}
+            .signal-buy {{ border-color: #00d4ff; }}
+            .signal-sell {{ border-color: #ff4757; }}
+            .signal-header {{
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 10px;
+            }}
+            .signal-direction {{
+                font-weight: bold;
+                font-size: 1.2em;
+            }}
+            .signal-symbol {{
+                font-family: monospace;
+                font-size: 1.1em;
+                color: #555;
+            }}
+            .signal-price {{
+                font-weight: bold;
+                color: #333;
+            }}
+            .signal-confidence {{
+                color: #667eea;
+                font-weight: 600;
+                margin-bottom: 5px;
+            }}
+            .signal-reasons {{
+                color: #666;
+                font-size: 0.95em;
+                margin-bottom: 5px;
+            }}
+            .signal-time {{
+                color: #999;
+                font-size: 0.85em;
+            }}
+            .no-signals {{
+                text-align: center;
+                padding: 40px;
+                color: #999;
+                font-size: 1.1em;
+            }}
+            .footer {{
+                text-align: center;
+                padding: 20px;
+                color: #666;
+                font-size: 0.9em;
+                background: #f8f9fa;
+            }}
+            .countdown {{
+                font-family: monospace;
+                background: #1a1a2e;
+                color: #00ff88;
+                padding: 5px 10px;
+                border-radius: 5px;
+                margin-left: 10px;
+            }}
+            .controls {{
+                display: flex;
+                gap: 10px;
+                margin-top: 20px;
+            }}
+            .btn {{
+                padding: 10px 20px;
+                border: none;
+                border-radius: 8px;
+                cursor: pointer;
+                font-weight: 600;
+                transition: all 0.3s;
+            }}
+            .btn-primary {{
+                background: #667eea;
+                color: white;
+            }}
+            .btn-primary:hover {{
+                background: #5a67d8;
+            }}
+            .btn-danger {{
+                background: #ff4757;
+                color: white;
+            }}
+            .btn-danger:hover {{
+                background: #ff3742;
+            }}
+            .btn-success {{
+                background: #2ed573;
+                color: white;
+            }}
+            .btn-success:hover {{
+                background: #25c464;
+            }}
+            @media (max-width: 768px) {{
+                .stats-grid {{
+                    grid-template-columns: 1fr;
+                }}
+                .header h1 {{
+                    font-size: 2em;
+                }}
+                .signal-header {{
+                    flex-direction: column;
+                    align-items: flex-start;
+                    gap: 5px;
+                }}
             }}
         </style>
     </head>
-    <body class="min-h-screen">
-        <div class="container mx-auto p-6 max-w-6xl">
-            <div class="text-center mb-10">
-                <h1 class="text-5xl font-bold mb-4 bg-gradient-to-r from-blue-500 to-purple-600 bg-clip-text text-transparent">
-                    🤖 Bot de Sinais Cripto Pro
-                </h1>
-                <p class="text-2xl flex items-center justify-center gap-3">
-                    Status: <span class="text-green-400 blink">● ONLINE</span>
-                    <span id="countdown" class="text-yellow-400 font-mono">{Config.BOT_INTERVAL}s até próxima scan</span>
-                </p>
-            </div>
-
-            <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-10">
-                <div class="bg-gray-800 rounded-2xl p-6 border border-gray-700">
-                    <h3 class="text-lg text-gray-400 mb-2">Pares Monitorados</h3>
-                    <p class="text-3xl font-bold">{len(PAIRS)}</p>
-                    <div class="progress-bar mt-2">
-                        <div class="progress-fill" style="width: {min(len(PAIRS)/20*100, 100)}%"></div>
-                    </div>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>🤖 Crypto Trading Bot Pro</h1>
+                <p>Monitoramento inteligente de criptomoedas em tempo real</p>
+                <div class="status online blink">
+                    <span>● ONLINE</span>
+                    <span class="countdown" id="countdown">{BOT_INTERVAL}s</span>
                 </div>
-                <div class="bg-gray-800 rounded-2xl p-6 border border-gray-700">
-                    <h3 class="text-lg text-gray-400 mb-2">Cache Hit Rate</h3>
-                    <p class="text-3xl font-bold">{hit_rate:.1f}%</p>
-                    <p class="text-sm text-gray-500 mt-2">{performance_metrics['cache_hits']} hits / {performance_metrics['cache_misses']} misses</p>
-                </div>
-                <div class="bg-gray-800 rounded-2xl p-6 border border-gray-700">
-                    <h3 class="text-lg text-gray-400 mb-2">Circuit Breaker</h3>
-                    <p class="text-3xl font-bold {cb_state_color}">{cb_status["state"]}</p>
-                    <p class="text-sm text-gray-500 mt-2">Falhas: {cb_status["failures"]}</p>
-                </div>
-                <div class="bg-gray-800 rounded-2xl p-6 border border-gray-700">
-                    <h3 class="text-lg text-gray-400 mb-2">Performance</h3>
-                    <p class="text-3xl font-bold">{calculate_avg_analysis_time()*1000:.0f}ms</p>
-                    <p class="text-sm text-gray-500 mt-2">Análise média por par</p>
+                
+                <div class="controls">
+                    <button class="btn btn-primary" onclick="window.location.href='/health'">Health Check</button>
+                    <button class="btn btn-success" onclick="window.location.href='/stats'">Estatísticas</button>
+                    <button class="btn btn-danger" onclick="window.location.href='/reset'">Reset Cache</button>
                 </div>
             </div>
-
-            <div class="bg-gray-800 rounded-2xl p-6 mb-10 border border-gray-700">
-                <h2 class="text-2xl font-bold mb-4 flex items-center gap-3">
-                    <i class="fas fa-brain text-purple-500"></i> Estratégias Ativas
-                </h2>
-                <div class="flex flex-wrap gap-3">
+            
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <h3>{len(PAIRS)}</h3>
+                    <p>Pares Monitorados</p>
+                    <small>{', '.join(PAIRS)}</small>
+                </div>
+                
+                <div class="stat-card">
+                    <h3>{cache_hit_rate:.1f}%</h3>
+                    <p>Cache Hit Rate</p>
+                    <small>{performance_stats['cache_hits']} hits / {performance_stats['cache_misses']} misses</small>
+                </div>
+                
+                <div class="stat-card">
+                    <h3 class="circuit-{circuit_state.lower()}">{circuit_state}</h3>
+                    <p>Circuit Breaker</p>
+                    <small>Falhas: {circuit_failures} | Status: {circuit_state}</small>
+                </div>
+                
+                <div class="stat-card">
+                    <h3>{success_rate:.1f}%</h3>
+                    <p>Taxa de Sucesso API</p>
+                    <small>{performance_stats['requests_success']} ok / {performance_stats['requests_failed']} falhas</small>
+                </div>
+            </div>
+            
+            <div class="section">
+                <div class="section-title">
+                    <span>🎯 Estratégias Ativas</span>
+                </div>
+                <div class="strategies">
                     {strategies_html}
                 </div>
-                <div class="mt-4 text-sm text-gray-400">
-                    <i class="fas fa-info-circle"></i> w = peso da estratégia
+                <p style="margin-top: 10px; color: #666; font-size: 0.9em;">
+                    <strong>Legenda:</strong> w = peso da estratégia | ● = ativa | ○ = inativa
+                </p>
+            </div>
+            
+            <div class="section">
+                <div class="section-title">
+                    <span>📈 Últimos Sinais Gerados</span>
+                </div>
+                <div class="signals-container">
+                    {signals_html}
                 </div>
             </div>
-
-            <div class="bg-gray-800 rounded-2xl p-6 border border-gray-700 mb-10">
-                <h2 class="text-2xl font-bold mb-6 flex items-center gap-3">
-                    <i class="fas fa-bolt text-yellow-500"></i> Últimos Sinais Gerados
-                </h2>
-                <div class="overflow-x-auto">
-                    {signals_table}
-                </div>
-            </div>
-
-            <div class="text-center mt-12 text-gray-500 text-sm">
-                Bot rodando desde {datetime.now().strftime("%d/%m/%Y %H:%M")} • 
-                Varredura a cada {Config.BOT_INTERVAL}s • 
-                v2.0 • 
-                <a href="/health" class="text-blue-400 hover:text-blue-300">Health Check</a> •
-                <a href="/metrics" class="text-blue-400 hover:text-blue-300">Metrics</a>
+            
+            <div class="footer">
+                <p>
+                    Bot rodando desde {datetime.now().strftime("%d/%m/%Y %H:%M")} • 
+                    Varredura a cada {BOT_INTERVAL}s • 
+                    v2.0 • 
+                    <a href="/health" style="color: #667eea;">Health</a> • 
+                    <a href="/api/signals" style="color: #667eea;">API</a>
+                </p>
+                <p style="margin-top: 10px; font-size: 0.8em; color: #999;">
+                    ⚠️ Este é um bot de análise. Não constitui recomendação de investimento.
+                </p>
             </div>
         </div>
-
+        
         <script>
-            let seconds = {Config.BOT_INTERVAL};
+            // Countdown timer
+            let seconds = {BOT_INTERVAL};
             const countdownEl = document.getElementById('countdown');
             
             setInterval(() => {{
-                seconds = seconds <= 0 ? {Config.BOT_INTERVAL} : seconds - 1;
-                countdownEl.innerText = seconds + 's até próxima scan';
+                seconds = seconds <= 0 ? {BOT_INTERVAL} : seconds - 1;
+                countdownEl.textContent = seconds + 's';
             }}, 1000);
             
-            // Auto-refresh a cada 30 segundos
-            setInterval(() => {{
+            // Auto-refresh a cada 60 segundos
+            setTimeout(() => {{
                 window.location.reload();
-            }}, 30000);
+            }}, 60000);
+            
+            // Smooth scroll para sinais
+            document.querySelectorAll('.signal').forEach(signal => {{
+                signal.addEventListener('click', () => {{
+                    signal.style.transform = 'scale(0.98)';
+                    setTimeout(() => signal.style.transform = '', 150);
+                }});
+            }});
         </script>
     </body>
     </html>
     """
 
-@app.route("/health")
+@app.route('/health')
 def health():
+    """Health check para Render"""
     return jsonify({
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
-        "signals_generated": len(last_signals),
-        "memory_usage": psutil.Process().memory_percent(),
-        "cache_size": len(kline_cache),
-        "circuit_breaker": binance_breaker.get_status(),
-        "uptime": time.time() - performance_metrics.get("start_time", time.time())
-    })
-
-@app.route("/metrics")
-@require_api_key
-def metrics():
-    return jsonify({
-        "pairs_monitored": len(PAIRS),
-        "active_strategies": sum(1 for s in STRATEGIES.values() if s["active"]),
-        "cache_stats": {
-            "hits": performance_metrics["cache_hits"],
-            "misses": performance_metrics["cache_misses"],
-            "hit_rate": calculate_cache_hit_rate(),
-            "size": len(kline_cache)
+        "service": "crypto-trading-bot",
+        "version": "2.0",
+        "uptime_seconds": int(time.time() - performance_stats.get("start_time", time.time())),
+        "memory_usage": "N/A",  # psutil não disponível em todas instâncias
+        "signals_count": len(last_signals),
+        "circuit_breaker": {
+            "state": circuit_state,
+            "failures": circuit_failures,
+            "last_failure": last_failure_time
         },
         "performance": {
-            "avg_analysis_time": calculate_avg_analysis_time(),
-            "last_scan_time": performance_metrics["last_scan_time"],
-            "total_requests": performance_metrics["total_requests"]
-        },
-        "signals": {
-            "total": len(last_signals),
-            "last_10": list(last_signals)[-10:] if last_signals else []
-        },
-        "errors_last_24h": len([e for e in performance_metrics["errors"] 
-                               if datetime.now() - e["time"] < timedelta(hours=24)])
+            "cache_hit_rate": f"{(performance_stats['cache_hits'] / (performance_stats['cache_hits'] + performance_stats['cache_misses'] + 0.001)) * 100:.1f}%",
+            "api_success_rate": f"{(performance_stats['requests_success'] / (performance_stats['requests_total'] + 0.001)) * 100:.1f}%",
+            "last_scan": performance_stats["last_scan"]
+        }
     })
 
-@app.route("/api/signals")
-@require_api_key
-def api_signals():
+@app.route('/stats')
+def stats():
+    """Página de estatísticas detalhadas"""
     return jsonify({
-        "signals": list(last_signals),
-        "count": len(last_signals),
+        "performance": performance_stats,
+        "configuration": {
+            "pairs": PAIRS,
+            "timeframes": TIMEFRAMES,
+            "interval_seconds": BOT_INTERVAL,
+            "strategies": STRATEGIES
+        },
+        "circuit_breaker": {
+            "state": circuit_state,
+            "failures": circuit_failures,
+            "last_failure": last_failure_time,
+            "is_open": circuit_state == "OPEN"
+        },
+        "signals": {
+            "total_generated": len(last_signals),
+            "last_10": list(last_signals)[-10:]
+        }
+    })
+
+@app.route('/reset')
+def reset():
+    """Resetar cache e circuit breaker"""
+    global kline_cache, circuit_state, circuit_failures, last_failure_time
+    
+    kline_cache.clear()
+    circuit_state = "CLOSED"
+    circuit_failures = 0
+    last_failure_time = 0
+    
+    logger.info("🔄 Cache e circuit breaker resetados")
+    return jsonify({
+        "status": "reset",
+        "message": "Cache e circuit breaker resetados com sucesso",
         "timestamp": datetime.now().isoformat()
     })
 
-@app.route("/api/analyze/<symbol>")
-@require_api_key
-def api_analyze(symbol):
-    signal = analyze_symbol(symbol)
-    return jsonify(signal or {"error": "No signal generated"})
-
-@app.route("/api/strategies", methods=["GET", "POST"])
-@require_api_key
-def api_strategies():
-    if request.method == "POST":
-        data = request.json
-        for strategy, config in data.items():
-            if strategy in STRATEGIES:
-                STRATEGIES[strategy].update(config)
-        return jsonify({"status": "updated", "strategies": STRATEGIES})
-    return jsonify(STRATEGIES)
-
-@app.route("/api/alerts", methods=["GET", "POST"])
-@require_api_key
-def api_alerts():
-    if request.method == "POST":
-        data = request.json
-        alert_id = alert_manager.add_alert(
-            data["symbol"],
-            data["condition_type"],
-            data["threshold"],
-            data.get("action", "telegram")
-        )
-        return jsonify({"status": "created", "alert_id": alert_id})
-    
+@app.route('/api/signals')
+def api_signals():
+    """API para obter sinais"""
     return jsonify({
-        "active_alerts": sum(len(alerts) for alerts in alert_manager.alerts.values()),
-        "triggered_alerts": list(alert_manager.triggered_alerts)[-10:]
+        "count": len(last_signals),
+        "signals": list(last_signals),
+        "timestamp": datetime.now().isoformat()
     })
 
-# =========================
-# LOOP PRINCIPAL (PARALELO)
-# =========================
-def run_bot():
-    performance_metrics["start_time"] = time.time()
-    logger.info("🤖 BOT INICIADO - Varredura paralela")
-    
-    while True:
-        try:
-            scan_start = time.time()
-            logger.info("=== NOVA VARREDURA INICIADA ===")
-            
-            signals_generated = 0
-            with ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as executor:
-                future_to_symbol = {
-                    executor.submit(analyze_symbol, symbol): symbol 
-                    for symbol in PAIRS
-                }
-                
-                for future in as_completed(future_to_symbol):
-                    symbol = future_to_symbol[future]
-                    try:
-                        signal = future.result(timeout=30)
-                        if signal:
-                            logger.info(f"SINAL GERADO: {signal['direction']} {symbol} - Confiança {signal['confidence']:.0%}")
-                            if send_signal(signal):
-                                signals_generated += 1
-                    except Exception as e:
-                        logger.error(f"Erro analisando {symbol}: {e}")
-            
-            scan_time = time.time() - scan_start
-            performance_metrics["last_scan_time"] = datetime.now().isoformat()
-            
-            logger.info(f"Varredura concluída em {scan_time:.1f}s. Sinais: {signals_generated}. Dormindo {Config.BOT_INTERVAL}s...")
-            time.sleep(Config.BOT_INTERVAL)
-            
-        except Exception as e:
-            logger.error(f"Erro no loop principal: {e}")
-            time.sleep(10)
+@app.route('/api/analyze/<symbol>')
+def api_analyze(symbol):
+    """API para analisar um símbolo específico"""
+    signal = analyze_symbol(symbol.upper())
+    return jsonify(signal if signal else {"error": "Nenhum sinal gerado"})
 
 # =========================
-# MAIN
+# LOOP DO BOT
+# =========================
+def run_bot():
+    """Loop principal do bot"""
+    performance_stats["start_time"] = time.time()
+    logger.info("=" * 60)
+    logger.info("🤖 BOT INICIADO - Crypto Trading Bot Pro v2.0")
+    logger.info("=" * 60)
+    logger.info(f"⚙️  Configuração:")
+    logger.info(f"   • Pares: {len(PAIRS)} -> {', '.join(PAIRS)}")
+    logger.info(f"   • Timeframes: {', '.join(TIMEFRAMES)}")
+    logger.info(f"   • Intervalo: {BOT_INTERVAL}s ({BOT_INTERVAL//60}min)")
+    logger.info(f"   • Estratégias: {len([s for s in STRATEGIES.values() if s['active']])} ativas")
+    logger.info("=" * 60)
+    
+    # Mensagem inicial no Telegram
+    if TELEGRAM_TOKEN and CHAT_ID:
+        startup_msg = (
+            f"🤖 *Crypto Bot Iniciado*\n"
+            f"📅 {datetime.now().strftime('%d/%m/%Y %H:%M')}\n"
+            f"📊 Monitorando {len(PAIRS)} pares\n"
+            f"⏰ Intervalo: {BOT_INTERVAL//60} minutos\n"
+            f"🎯 {len([s for s in STRATEGIES.values() if s['active']])} estratégias ativas\n"
+            f"\nBot pronto para operar! ✅"
+        )
+        send_telegram(startup_msg)
+        logger.info("✅ Mensagem inicial enviada para Telegram")
+    else:
+        logger.warning("⚠️  Telegram não configurado. Sinais não serão enviados.")
+    
+    # Loop principal
+    while True:
+        try:
+            scan_start = datetime.now()
+            logger.info(f"🔍 [{scan_start.strftime('%H:%M:%S')}] Iniciando varredura...")
+            
+            signals_found = 0
+            for symbol in PAIRS:
+                signal = analyze_symbol(symbol)
+                if signal:
+                    logger.info(f"   📢 Sinal encontrado: {signal['direction']} {signal['symbol']}")
+                    if send_signal(signal):
+                        signals_found += 1
+                    time.sleep(2)  # Pausa entre envios
+            
+            scan_duration = (datetime.now() - scan_start).total_seconds()
+            performance_stats["last_scan"] = scan_start.isoformat()
+            
+            logger.info(f"✅ [{datetime.now().strftime('%H:%M:%S')}] Varredura concluída em {scan_duration:.1f}s")
+            logger.info(f"   📊 Sinais encontrados: {signals_found}")
+            logger.info(f"   ⏰ Próxima varredura em {BOT_INTERVAL//60} minutos...")
+            logger.info("-" * 60)
+            
+            # Sleep até próxima varredura
+            time.sleep(BOT_INTERVAL)
+            
+        except KeyboardInterrupt:
+            logger.info("👋 Bot interrompido pelo usuário")
+            break
+        except Exception as e:
+            logger.error(f"❌ Erro no loop principal: {e}")
+            logger.error("⏰ Aguardando 30 segundos antes de retry...")
+            time.sleep(30)
+
+# =========================
+# MANTER APP ATIVO NO RENDER
+# =========================
+def keep_alive():
+    """Ping automático para manter app ativo no Render free"""
+    time.sleep(10)  # Esperar app iniciar
+    while True:
+        try:
+            # Tentar pingar a si mesmo
+            requests.get(f"http://localhost:{PORT}/health", timeout=5)
+            logger.debug("✅ Ping interno para manter ativo")
+        except:
+            pass
+        time.sleep(180)  # A cada 3 minutos
+
+# =========================
+# INICIALIZAÇÃO
 # =========================
 def main():
-    logger.info(f"🚀 Iniciando Bot de Sinais Cripto Pro v2.0")
-    logger.info(f"📊 Pares: {len(PAIRS)} | Estratégias: {sum(1 for s in STRATEGIES.values() if s['active'])}")
-    logger.info(f"⚙️ Config: Interval={Config.BOT_INTERVAL}s, Confidence={Config.MIN_CONFIDENCE}")
+    """Função principal"""
+    logger.info(f"🚀 Iniciando aplicação na porta {PORT}")
     
-    if Config.TELEGRAM_TOKEN and Config.CHAT_ID:
-        logger.info("✅ Telegram configurado")
-        send_telegram(f"🤖 Bot iniciado em {datetime.now().strftime('%d/%m/%Y %H:%M')}")
-    else:
-        logger.warning("⚠️ Telegram não configurado")
-    
-    # Adicionar alguns alertas de exemplo
-    alert_manager.add_alert("BTCUSDT", "PRICE_ABOVE", 45000)
-    alert_manager.add_alert("BTCUSDT", "RSI_BELOW", 30)
+    # Iniciar thread para manter ativo (apenas se necessário)
+    # alive_thread = threading.Thread(target=keep_alive, daemon=True)
+    # alive_thread.start()
     
     # Iniciar bot em thread separada
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
+    logger.info("🧵 Bot worker iniciado em background")
     
     # Iniciar servidor web
-    if Config.ENABLE_WEB:
-        logger.info(f"🌐 Dashboard disponível em http://0.0.0.0:10000")
-        app.run(host="0.0.0.0", port=10000, debug=False)
-    else:
-        logger.info("🌐 Web interface desabilitada")
-        bot_thread.join()
+    logger.info(f"🌐 Servidor web iniciando em http://0.0.0.0:{PORT}")
+    logger.info(f"📊 Dashboard: http://localhost:{PORT}")
+    logger.info(f"🏥 Health: http://localhost:{PORT}/health")
+    logger.info(f"📈 Stats: http://localhost:{PORT}/stats")
+    
+    try:
+        app.run(
+            host='0.0.0.0',
+            port=PORT,
+            debug=False,
+            use_reloader=False,
+            threaded=True
+        )
+    except Exception as e:
+        logger.error(f"❌ Erro no servidor web: {e}")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
