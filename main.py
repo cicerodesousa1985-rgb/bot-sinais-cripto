@@ -245,64 +245,53 @@ def calculate_timeframe_agreement(timeframe_signals):
 # =========================
 # BINANCE API COM CACHE E CIRCUIT BREAKER
 # =========================
-def get_binance_klines(symbol, interval="1m", limit=100, retries=3):
-    def _make_request():
-        key = (symbol, interval)
-        now = time.time()
-        
-        # Verificar cache
-        if key in kline_cache:
-            data, ts, expiry = kline_cache[key]
-            if now < expiry:
-                performance_metrics["cache_hits"] += 1
-                return data
-            else:
-                del kline_cache[key]
-        
-        performance_metrics["cache_misses"] += 1
-        performance_metrics["total_requests"] += 1
-        
-        logger.info(f"Requisitando klines: {symbol} {interval} limit={limit}")
-        try:
-            response = requests.get(
-                "https://api.binance.com/api/v3/klines",
-                params={
-                    "symbol": symbol,
-                    "interval": interval,
-                    "limit": limit
-                },
-                timeout=15
-            )
-            response.raise_for_status()
-            
-            data = response.json()
-            # Cache com TTL
-            kline_cache[key] = (data, now, now + Config.CACHE_TTL)
-            cache_stats[symbol] = cache_stats.get(symbol, 0) + 1
-            
-            logger.info(f"Sucesso ao pegar klines para {symbol} {interval}")
-            return data
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Erro na requisição para {symbol}: {e}")
-            raise
+def get_binance_klines(symbol, interval="5m", limit=50):
+    """Busca dados da Binance com cache simples"""
+    key = f"{symbol}_{interval}"
     
-    # Tentar com retry e circuit breaker
-    for attempt in range(retries):
-        try:
-            return binance_breaker.call(_make_request)
-        except Exception as e:
-            if attempt < retries - 1:
-                wait_time = 2 ** attempt
-                logger.info(f"Tentativa {attempt+1}/{retries} falhou. Aguardando {wait_time}s...")
-                time.sleep(wait_time)
-            else:
-                logger.error(f"Falha após {retries} tentativas para {symbol}")
-                performance_metrics["errors"].append({
-                    "time": datetime.now(),
-                    "symbol": symbol,
-                    "error": str(e)
-                })
-                return None
+    # Verificar cache (60 segundos)
+    if key in kline_cache:
+        data, timestamp = kline_cache[key]
+        if time.time() - timestamp < 60:
+            return data
+    
+    try:
+        url = "https://api.binance.com/api/v3/klines"
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit
+        }
+        
+        # ADICIONE ESTES HEADERS:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'application/json',
+        }
+        
+        response = requests.get(
+            url, 
+            params=params, 
+            timeout=15,  # Aumente timeout
+            headers=headers  # Adicione headers
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            kline_cache[key] = (data, time.time())
+            logger.info(f"✅ Dados obtidos: {symbol} {interval}")
+            return data
+        else:
+            logger.error(f"❌ Erro HTTP {response.status_code} para {symbol}")
+            
+    except requests.exceptions.Timeout:
+        logger.error(f"⏰ Timeout para {symbol}")
+    except requests.exceptions.ConnectionError:
+        logger.error(f"🔌 Erro de conexão para {symbol}")
+    except Exception as e:
+        logger.error(f"⚠️  Erro ao buscar {symbol}: {str(e)[:100]}")
+    
+    return None
 
 # =========================
 # INDICADORES
