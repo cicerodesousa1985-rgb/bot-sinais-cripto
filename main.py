@@ -58,6 +58,7 @@ def get_binance_klines(symbol, interval="1m", limit=100):
         if now - ts < CACHE_TTL:
             return data
 
+    logger.info(f"Requisitando klines: {symbol} {interval} limit={limit}")
     try:
         r = requests.get(
             "https://api.binance.com/api/v3/klines",
@@ -67,10 +68,14 @@ def get_binance_klines(symbol, interval="1m", limit=100):
         if r.status_code == 200:
             data = r.json()
             kline_cache[key] = (data, now)
+            logger.info(f"Sucesso ao pegar klines para {symbol} {interval}")
             return data
+        else:
+            logger.warning(f"Erro HTTP {r.status_code} para {symbol} {interval}: {r.text}")
     except Exception as e:
-        logger.error(f"Erro Binance {symbol} {interval}: {e}")
+        logger.error(f"Erro ao conectar Binance {symbol} {interval}: {e}")
 
+    logger.warning(f"Falha total em pegar klines para {symbol} {interval} - retornando None")
     return None
 
 # =========================
@@ -204,6 +209,9 @@ def analyze_symbol(symbol):
             buy_score += w if d == "COMPRA" else 0
             sell_score += w if d == "VENDA" else 0
 
+    logger.info(f"{symbol}: Dados OK em {len(used_tfs)} TFs ({', '.join(used_tfs or ['nenhum'])}). "
+                f"Buy_score: {buy_score:.1f} | Sell_score: {sell_score:.1f}")
+
     if len(used_tfs) < 2:
         return None
 
@@ -229,6 +237,7 @@ def analyze_symbol(symbol):
 # =========================
 def send_telegram(msg):
     if not TELEGRAM_TOKEN or not CHAT_ID:
+        logger.warning("Telegram não configurado (TOKEN ou CHAT_ID ausente)")
         return
     try:
         requests.post(
@@ -236,15 +245,15 @@ def send_telegram(msg):
             json={"chat_id": CHAT_ID, "text": msg},
             timeout=10
         )
-    except:
-        pass
+    except Exception as e:
+        logger.error(f"Erro ao enviar Telegram: {e}")
 
 def send_signal(signal):
     emoji = "🚀" if signal["direction"] == "COMPRA" else "🔻"
     msg = (
-        f"{emoji} {signal['direction']}\n"
-        f"Par: {signal['symbol']}\n"
-        f"Preço: {signal['price']:.4f}\n"
+        f"{emoji} *{signal['direction']}*\n"
+        f"Par: `{signal['symbol']}`\n"
+        f"Preço: `${signal['price']:.4f}`\n"
         f"Confiança: {signal['confidence']:.0%}\n"
         f"Razões:\n" + "\n".join(signal["reasons"])
     )
@@ -253,41 +262,126 @@ def send_signal(signal):
     last_signals[:] = last_signals[-10:]
 
 # =========================
-# DASHBOARD WEB COM IA
+# DASHBOARD WEB BONITÃO
 # =========================
 @app.route("/")
 def dashboard():
     strategies_html = "".join(
-        f"<li>{k} ✅</li>" if v["active"] else f"<li>{k} ❌</li>"
+        f'<span class="px-3 py-1 rounded-full text-xs font-bold {"bg-green-600" if v["active"] else "bg-red-600"}">'
+        f'{k.replace("_", " ")}</span>'
         for k, v in STRATEGIES.items()
     )
 
-    signals_html = "".join(
-        f"<div><b>{s['direction']}</b> | {s['symbol']} | {s['confidence']:.0%}</div>"
-        for s in last_signals[::-1]
-    ) or "<p>Nenhum sinal ainda</p>"
+    signals_table = ""
+    if last_signals:
+        signals_table = """
+        <table class="w-full table-auto border-collapse">
+            <thead>
+                <tr class="bg-gray-800">
+                    <th class="px-4 py-3 text-left">Direção</th>
+                    <th class="px-4 py-3 text-left">Par</th>
+                    <th class="px-4 py-3 text-right">Preço</th>
+                    <th class="px-4 py-3 text-right">Confiança</th>
+                    <th class="px-4 py-3 text-left">Motivos</th>
+                    <th class="px-4 py-3 text-right">Horário</th>
+                </tr>
+            </thead>
+            <tbody>
+        """
+        for s in reversed(last_signals):
+            emoji = "🟢" if s["direction"] == "COMPRA" else "🔴"
+            color = "text-green-400" if s["direction"] == "COMPRA" else "text-red-400"
+            time_str = s["timestamp"].strftime("%H:%M:%S")
+            reasons = " • ".join(s["reasons"])
+            signals_table += f"""
+                <tr class="border-b border-gray-700 hover:bg-gray-800 transition">
+                    <td class="px-4 py-3 {color} font-bold">{emoji} {s['direction']}</td>
+                    <td class="px-4 py-3 font-mono">{s['symbol']}</td>
+                    <td class="px-4 py-3 text-right font-mono">${s['price']:,.2f}</td>
+                    <td class="px-4 py-3 text-right">{int(s['confidence']*100)}%</td>
+                    <td class="px-4 py-3 text-sm text-gray-400">{reasons}</td>
+                    <td class="px-4 py-3 text-right text-xs text-gray-500">{time_str}</td>
+                </tr>
+            """
+        signals_table += "</tbody></table>"
+    else:
+        signals_table = '<p class="text-gray-400 text-center py-8">Aguardando primeiros sinais...</p>'
 
     return f"""
-    <html>
-    <head><title>Bot Sinais Cripto</title></head>
-    <body style="background:#020617;color:#e5e7eb;font-family:Arial;padding:30px">
-        <h1>🤖 Bot de Sinais Cripto</h1>
-        <p>Status: Online ✅</p>
-        <p><b>Pares:</b> {', '.join(PAIRS)}</p>
-        <p><b>Timeframes:</b> {', '.join(TIMEFRAMES)}</p>
+    <!DOCTYPE html>
+    <html lang="pt-BR" class="bg-gray-900 text-gray-100">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>🤖 Bot Sinais Cripto</title>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
+        <style>
+            body {{ font-family: 'Segoe UI', sans-serif; }}
+            .blink {{ animation: blink 1s infinite; }}
+            @keyframes blink {{ 50% {{ opacity: 0.5; }} }}
+        </style>
+    </head>
+    <body class="min-h-screen">
+        <div class="container mx-auto p-6 max-w-6xl">
+            <div class="text-center mb-10">
+                <h1 class="text-5xl font-bold mb-4 bg-gradient-to-r from-blue-500 to-purple-600 bg-clip-text text-transparent">
+                    🤖 Bot de Sinais Cripto
+                </h1>
+                <p class="text-2xl flex items-center justify-center gap-3">
+                    Status: <span class="text-green-400 blink">● ONLINE</span>
+                    <span id="countdown" class="text-yellow-400 font-mono">60s até próxima scan</span>
+                </p>
+            </div>
 
-        <h2>⚙️ Estratégias</h2>
-        <ul>{strategies_html}</ul>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-10">
+                <div class="bg-gray-800 rounded-2xl p-6 border border-gray-700">
+                    <h3 class="text-lg text-gray-400 mb-2">Pares Monitorados</h3>
+                    <p class="text-3xl font-bold">{len(PAIRS)}</p>
+                    <p class="text-sm text-gray-500 mt-2">{', '.join(PAIRS[:6])}{"..." if len(PAIRS)>6 else ""}</p>
+                </div>
+                <div class="bg-gray-800 rounded-2xl p-6 border border-gray-700">
+                    <h3 class="text-lg text-gray-400 mb-2">Timeframes</h3>
+                    <p class="text-3xl font-bold">{len(TIMEFRAMES)}</p>
+                    <p class="text-sm text-gray-500 mt-2">Multi-timeframe: {', '.join(TIMEFRAMES)}</p>
+                </div>
+                <div class="bg-gray-800 rounded-2xl p-6 border border-gray-700">
+                    <h3 class="text-lg text-gray-400 mb-2">Sinais Enviados</h3>
+                    <p class="text-3xl font-bold">{len(last_signals)}</p>
+                    <p class="text-sm text-gray-500 mt-2">Últimos 10 exibidos</p>
+                </div>
+            </div>
 
-        <h2>🧠 Inteligência Artificial</h2>
-        <p>
-            O bot utiliza um <b>sistema especialista com pontuação adaptativa</b>,
-            combinando múltiplos indicadores, pesos estratégicos,
-            validação multi-timeframe e memória de contexto.
-        </p>
+            <div class="bg-gray-800 rounded-2xl p-6 mb-10 border border-gray-700">
+                <h2 class="text-2xl font-bold mb-4 flex items-center gap-3">
+                    <i class="fas fa-brain text-purple-500"></i> Estratégias Ativas
+                </h2>
+                <div class="flex flex-wrap gap-3">
+                    {strategies_html}
+                </div>
+            </div>
 
-        <h2>📡 Últimos sinais</h2>
-        {signals_html}
+            <div class="bg-gray-800 rounded-2xl p-6 border border-gray-700">
+                <h2 class="text-2xl font-bold mb-6 flex items-center gap-3">
+                    <i class="fas fa-bolt text-yellow-500"></i> Últimos Sinais Gerados
+                </h2>
+                <div class="overflow-x-auto">
+                    {signals_table}
+                </div>
+            </div>
+
+            <div class="text-center mt-12 text-gray-500 text-sm">
+                Bot rodando desde {datetime.now().strftime("%d/%m/%Y %H:%M")} • Varredura a cada 60s
+            </div>
+        </div>
+
+        <script>
+            let seconds = 60;
+            setInterval(() => {
+                seconds = seconds <= 0 ? 60 : seconds - 1;
+                document.getElementById('countdown').innerText = seconds + 's até próxima scan';
+            }, 1000);
+        </script>
     </body>
     </html>
     """
@@ -296,13 +390,16 @@ def dashboard():
 # LOOP PRINCIPAL
 # =========================
 def run_bot():
-    logger.info("🤖 BOT INICIADO")
+    logger.info("🤖 BOT INICIADO - Iniciando varredura dos pares")
     while True:
+        logger.info("=== NOVA VARREDURA INICIADA ===")
         for symbol in PAIRS:
             signal = analyze_symbol(symbol)
             if signal:
+                logger.info(f"SINAL GERADO: {signal['direction']} {symbol} - Confiança {signal['confidence']:.0%}")
                 send_signal(signal)
                 time.sleep(1)
+        logger.info("Varredura concluída. Dormindo 60s...")
         time.sleep(60)
 
 # =========================
@@ -310,6 +407,7 @@ def run_bot():
 # =========================
 def main():
     threading.Thread(target=run_bot, daemon=True).start()
+    logger.info(f"Dashboard disponível em http://0.0.0.0:10000")
     app.run(host="0.0.0.0", port=10000)
 
 if __name__ == "__main__":
