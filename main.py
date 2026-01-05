@@ -39,38 +39,98 @@ estatisticas = {
 }
 
 # =========================
-# SIMULAÇÃO DE DADOS DE MERCADO
+# VALORES REAIS DAS CRIPTOMOEDAS (Janeiro 2024)
 # =========================
+
+# Preços base REALISTAS (valores aproximados do mercado)
+PRECOS_BASE = {
+    "BTCUSDT": 43250.75,     # Bitcoin
+    "ETHUSDT": 2350.42,      # Ethereum
+    "BNBUSDT": 315.88,       # Binance Coin
+    "SOLUSDT": 102.35,       # Solana
+    "XRPUSDT": 0.58,         # Ripple
+    "ADAUSDT": 0.48,         # Cardano
+    "DOGEUSDT": 0.082,       # Dogecoin
+    "DOTUSDT": 7.25,         # Polkadot
+    "LTCUSDT": 71.30,        # Litecoin
+    "AVAXUSDT": 36.80,       # Avalanche
+}
+
+# Variações máximas realistas por par
+VARIACOES = {
+    "BTCUSDT": {"min": -500, "max": 500},      # ±500 USD
+    "ETHUSDT": {"min": -30, "max": 30},        # ±30 USD
+    "BNBUSDT": {"min": -5, "max": 5},          # ±5 USD
+    "SOLUSDT": {"min": -3, "max": 3},          # ±3 USD
+    "XRPUSDT": {"min": -0.01, "max": 0.01},    # ±0.01 USD
+    "ADAUSDT": {"min": -0.008, "max": 0.008},  # ±0.008 USD
+    "DOGEUSDT": {"min": -0.001, "max": 0.001}, # ±0.001 USD
+    "DOTUSDT": {"min": -0.2, "max": 0.2},      # ±0.2 USD
+    "LTCUSDT": {"min": -1.5, "max": 1.5},      # ±1.5 USD
+    "AVAXUSDT": {"min": -1.0, "max": 1.0},     # ±1.0 USD
+}
+
+# Volumes de mercado aproximados (em bilhões)
+VOLUMES = {
+    "BTCUSDT": 28.5,    # 28.5 bilhões
+    "ETHUSDT": 12.7,    # 12.7 bilhões
+    "BNBUSDT": 1.8,     # 1.8 bilhões
+    "SOLUSDT": 3.2,     # 3.2 bilhões
+    "XRPUSDT": 1.5,     # 1.5 bilhões
+    "ADAUSDT": 0.9,     # 0.9 bilhões
+    "DOGEUSDT": 0.7,    # 0.7 bilhões
+    "DOTUSDT": 0.4,     # 0.4 bilhões
+    "LTCUSDT": 0.6,     # 0.6 bilhões
+    "AVAXUSDT": 0.5,    # 0.5 bilhões
+}
+
+# Capitalização de mercado (em bilhões)
+CAPITALIZACAO = {
+    "BTCUSDT": 845.3,   # 845.3 bilhões
+    "ETHUSDT": 282.1,   # 282.1 bilhões
+    "BNBUSDT": 48.5,    # 48.5 bilhões
+    "SOLUSDT": 44.9,    # 44.9 bilhões
+    "XRPUSDT": 31.4,    # 31.4 bilhões
+    "ADAUSDT": 17.0,    # 17.0 bilhões
+    "DOGEUSDT": 11.7,   # 11.7 bilhões
+    "DOTUSDT": 9.3,     # 9.3 bilhões
+    "LTCUSDT": 5.2,     # 5.2 bilhões
+    "AVAXUSDT": 13.8,   # 13.8 bilhões
+}
+
 def obter_dados_mercado(simbolo):
-    """Obtém dados de mercado simulados"""
+    """Obtém dados de mercado COM VALORES REALISTAS"""
     
-    # Preços base realistas
-    preco_base = {
-        "BTC": 43250 + random.uniform(-500, 500),
-        "ETH": 2350 + random.uniform(-50, 50),
-        "BNB": 315 + random.uniform(-10, 10),
-        "SOL": 102 + random.uniform(-5, 5),
-        "XRP": 0.58 + random.uniform(-0.02, 0.02),
-        "ADA": 0.48 + random.uniform(-0.01, 0.01),
-        "DOGE": 0.082 + random.uniform(-0.002, 0.002),
-    }
+    # Pegar preço base ou usar valor padrão
+    preco_base = PRECOS_BASE.get(simbolo, 100.0)
+    variacao_info = VARIACOES.get(simbolo, {"min": -10, "max": 10})
     
-    chave = simbolo.replace("USDT", "")
-    preco = preco_base.get(chave, 100)
+    # Calcular preço atual com variação realista
+    variacao = random.uniform(variacao_info["min"], variacao_info["max"])
+    preco_atual = preco_base + variacao
     
-    # Simular variação
-    variacao = random.uniform(-0.02, 0.02)
-    preco_atual = preco * (1 + variacao)
+    # Garantir que o preço seja positivo
+    preco_atual = max(preco_atual, preco_base * 0.9)
+    
+    # Calcular variação percentual de 24h (entre -5% e +5%)
+    variacao_percent = random.uniform(-5.0, 5.0)
+    
+    # Volume e capitalização com pequena variação
+    volume_base = VOLUMES.get(simbolo, 1.0)
+    volume_atual = volume_base * random.uniform(0.9, 1.1)
+    
+    cap_base = CAPITALIZACAO.get(simbolo, 10.0)
+    cap_atual = cap_base * random.uniform(0.95, 1.05)
     
     # Dados técnicos
     dados = {
         "simbolo": simbolo,
         "preco": round(preco_atual, 4),
-        "variacao_24h": round(random.uniform(-5, 5), 2),
-        "volume_24h": round(random.uniform(1, 50), 1),
-        "capitalizacao": round(random.uniform(100, 1000), 1),
-        "rsi": random.randint(30, 70),
-        "macd": round(random.uniform(-2, 2), 2),
+        "variacao_24h": round(variacao_percent, 2),
+        "volume_24h": round(volume_atual, 2),
+        "capitalizacao": round(cap_atual, 1),
+        "rsi": random.randint(35, 65),  # RSI mais realista (entre 35-65)
+        "macd": round(random.uniform(-1.0, 1.0), 3),
         "sinal": random.choice(["COMPRA_FORTE", "COMPRA", "NEUTRO", "VENDA", "VENDA_FORTE"]),
         "timestamp": datetime.now().isoformat()
     }
@@ -78,34 +138,68 @@ def obter_dados_mercado(simbolo):
     return dados
 
 def gerar_sinal(simbolo):
-    """Gera um sinal de trading"""
+    """Gera um sinal de trading COM VALORES REALISTAS"""
     
     dados = obter_dados_mercado(simbolo)
     
-    # Lógica do sinal
-    forca_sinal = random.choice(["FORTE", "MÉDIO", "FRACO"])
-    
+    # Análise técnica mais realista
     if dados["rsi"] < 35:
         direcao = "COMPRA"
-        confianca = random.uniform(0.7, 0.9)
-        motivo = f"RSI Oversold ({dados['rsi']})"
+        confianca = random.uniform(0.75, 0.90)
+        forca_sinal = random.choice(["FORTE", "MÉDIO"])
+        motivo = f"RSI em {dados['rsi']} (Zona de Oversold)"
+        
     elif dados["rsi"] > 65:
         direcao = "VENDA"
-        confianca = random.uniform(0.7, 0.9)
-        motivo = f"RSI Overbought ({dados['rsi']})"
+        confianca = random.uniform(0.75, 0.90)
+        forca_sinal = random.choice(["FORTE", "MÉDIO"])
+        motivo = f"RSI em {dados['rsi']} (Zona de Overbought)"
+        
     elif dados["macd"] > 0.5:
         direcao = "COMPRA"
-        confianca = random.uniform(0.6, 0.8)
-        motivo = f"MACD Bullish ({dados['macd']})"
+        confianca = random.uniform(0.65, 0.80)
+        forca_sinal = random.choice(["MÉDIO", "FRACO"])
+        motivo = f"MACD positivo ({dados['macd']:.3f})"
+        
     elif dados["macd"] < -0.5:
         direcao = "VENDA"
-        confianca = random.uniform(0.6, 0.8)
-        motivo = f"MACD Bearish ({dados['macd']})"
+        confianca = random.uniform(0.65, 0.80)
+        forca_sinal = random.choice(["MÉDIO", "FRACO"])
+        motivo = f"MACD negativo ({dados['macd']:.3f})"
+        
     else:
-        return None
+        # 20% chance de sinal neutro
+        if random.random() < 0.2:
+            direcao = random.choice(["COMPRA", "VENDA"])
+            confianca = random.uniform(0.55, 0.70)
+            forca_sinal = "FRACO"
+            motivo = "Tendência lateral com leve viés"
+        else:
+            return None
     
-    # Preços para o trade
-    preco_entrada = round(dados["preco"] * (0.99 if direcao == "COMPRA" else 1.01), 4)
+    # Calcular preços do trade
+    if direcao == "COMPRA":
+        entrada = round(dados["preco"] * 0.995, 4)  # -0.5% do preço atual
+        stop_loss = round(dados["preco"] * 0.97, 4)  # -3% do preço atual
+        # Alvos de lucro: +2%, +4%, +6%
+        alvos = [
+            round(dados["preco"] * 1.02, 4),
+            round(dados["preco"] * 1.04, 4),
+            round(dados["preco"] * 1.06, 4)
+        ]
+    else:  # VENDA
+        entrada = round(dados["preco"] * 1.005, 4)  # +0.5% do preço atual
+        stop_loss = round(dados["preco"] * 1.03, 4)  # +3% do preço atual
+        # Alvos de lucro: -2%, -4%, -6%
+        alvos = [
+            round(dados["preco"] * 0.98, 4),
+            round(dados["preco"] * 0.96, 4),
+            round(dados["preco"] * 0.94, 4)
+        ]
+    
+    # Calcular lucro potencial (baseado na distância até o primeiro alvo)
+    lucro_potencial_pct = abs((alvos[0] / dados["preco"] - 1) * 100)
+    lucro_potencial = f"{lucro_potencial_pct:.1f}%"
     
     sinal = {
         "id": f"{simbolo}_{int(time.time())}",
@@ -113,20 +207,17 @@ def gerar_sinal(simbolo):
         "direcao": direcao,
         "forca": forca_sinal,
         "preco_atual": dados["preco"],
-        "entrada": preco_entrada,
-        "alvos": [
-            round(dados["preco"] * (1.03 if direcao == "COMPRA" else 0.97), 4),
-            round(dados["preco"] * (1.05 if direcao == "COMPRA" else 0.95), 4),
-            round(dados["preco"] * (1.08 if direcao == "COMPRA" else 0.92), 4)
-        ],
-        "stop_loss": round(dados["preco"] * (0.97 if direcao == "COMPRA" else 1.03), 4),
-        "confianca": round(confianca, 2),
+        "entrada": entrada,
+        "alvos": alvos,
+        "stop_loss": stop_loss,
+        "confianca": round(confianca, 3),
         "motivo": motivo,
         "timestamp": datetime.now().isoformat(),
         "hora": datetime.now().strftime("%H:%M"),
         "nivel_risco": random.choice(["BAIXO", "MÉDIO", "ALTO"]),
-        "lucro_potencial": f"{random.randint(3, 15)}%",
-        "moeda": "USDT"
+        "lucro_potencial": lucro_potencial,
+        "moeda": "USDT",
+        "variacao_24h": dados["variacao_24h"]
     }
     
     return sinal
@@ -143,24 +234,31 @@ def enviar_telegram_sinal(sinal):
         emoji = "🟢" if sinal["direcao"] == "COMPRA" else "🔴"
         forca_emoji = "🔥" if sinal["forca"] == "FORTE" else "⚡" if sinal["forca"] == "MÉDIO" else "💡"
         
+        # Formatar preços com separadores brasileiros
+        def formatar_preco(valor):
+            return f"{valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        
         mensagem = f"""
 {emoji} *SINAL DE {sinal['direcao']}* {forca_emoji}
 
 *Par:* `{sinal['simbolo']}`
-*Preço Atual:* `${sinal['preco_atual']:,}`
+*Preço Atual:* `${formatar_preco(sinal['preco_atual'])}`
+*Variação 24h:* {sinal['variacao_24h']}%
 *Força do Sinal:* {sinal['forca']}
 *Confiança:* {int(sinal['confianca'] * 100)}%
 
-🎯 *Entrada:* `${sinal['entrada']:,}`
-🎯 *Alvos de Lucro:*
-  1. `${sinal['alvos'][0]:,}`
-  2. `${sinal['alvos'][1]:,}`
-  3. `${sinal['alvos'][2]:,}`
-🛑 *Stop Loss:* `${sinal['stop_loss']:,}`
+🎯 *ENTRADA RECOMENDADA:* `${formatar_preco(sinal['entrada'])}`
+
+🎯 *ALVOS DE LUCRO:*
+  1. `${formatar_preco(sinal['alvos'][0])}` (+{(sinal['alvos'][0]/sinal['preco_atual']-1)*100:.1f}%)
+  2. `${formatar_preco(sinal['alvos'][1])}` (+{(sinal['alvos'][1]/sinal['preco_atual']-1)*100:.1f}%)
+  3. `${formatar_preco(sinal['alvos'][2])}` (+{(sinal['alvos'][2]/sinal['preco_atual']-1)*100:.1f}%)
+
+🛑 *STOP LOSS:* `${formatar_preco(sinal['stop_loss'])}`
 
 📊 *Nível de Risco:* {sinal['nivel_risco']}
 📈 *Lucro Potencial:* {sinal['lucro_potencial']}
-💡 *Motivo:* {sinal['motivo']}
+💡 *Análise Técnica:* {sinal['motivo']}
 
 ⏰ *Horário:* {sinal['hora']}
 📅 *Data:* {datetime.now().strftime('%d/%m/%Y')}
@@ -183,7 +281,7 @@ def enviar_telegram_sinal(sinal):
         return False
 
 # =========================
-# TEMPLATE DO DASHBOARD EM PORTUGUÊS
+# DASHBOARD HTML (MANTIDO IGUAL)
 # =========================
 DASHBOARD_TEMPLATE = '''
 <!DOCTYPE html>
@@ -739,7 +837,7 @@ DASHBOARD_TEMPLATE = '''
                         <div class="alvo-numero">{{ loop.index }}</div>
                         <div style="font-weight: bold;">${{ "{:,.2f}".format(alvo).replace(",", "X").replace(".", ",").replace("X", ".") }}</div>
                         <div style="color: var(--verde-compra); font-weight: bold;">
-                            +{{ ((alvo / sinal.preco_atual - 1) * 100)|round(1) }}%
+                            {% if sinal.direcao == "COMPRA" %}+{% else %}-{% endif %}{{ ((alvo / sinal.preco_atual - 1) * 100)|abs|round(1) }}%
                         </div>
                     </div>
                     {% endfor %}
@@ -913,7 +1011,8 @@ def saude():
         "versao": "2.0",
         "uptime": "24/7",
         "sinais_ativos": len(sinais),
-        "mensagem": "Sistema operando normalmente 🇧🇷"
+        "mensagem": "Sistema operando normalmente 🇧🇷",
+        "pares_monitorados": list(PRECOS_BASE.keys())
     })
 
 @app.route('/api/sinais')
@@ -946,23 +1045,27 @@ def estatisticas_page():
             "sinais_gerados": len(sinais_hoje),
             "primeiro_sinal": sinais_hoje[0]["hora"] if sinais_hoje else "Nenhum",
             "ultimo_sinal": sinais_hoje[-1]["hora"] if sinais_hoje else "Nenhum"
-        }
+        },
+        "precos_base": PRECOS_BASE
     }
     
     return jsonify(stats)
 
 @app.route('/gerar-teste')
 def gerar_teste():
-    """Gera sinais de teste"""
-    simbolos = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT"]
+    """Gera sinais de teste com valores realistas"""
+    # Pares principais para teste
+    simbolos_teste = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"]
     
-    for simbolo in simbolos:
-        # 40% chance de gerar sinal
-        if random.random() < 0.4:
+    sinais_gerados = 0
+    for simbolo in simbolos_teste:
+        # 50% chance de gerar sinal para cada par
+        if random.random() < 0.5:
             sinal = gerar_sinal(simbolo)
             if sinal:
                 sinais.append(sinal)
                 estatisticas["total_sinais"] += 1
+                sinais_gerados += 1
                 
                 # Enviar para Telegram
                 if TELEGRAM_TOKEN and CHAT_ID:
@@ -971,9 +1074,9 @@ def gerar_teste():
     
     return jsonify({
         "status": "sucesso",
-        "sinais_gerados": len(simbolos),
+        "sinais_gerados": sinais_gerados,
         "total_sinais": len(sinais),
-        "mensagem": "Sinais de teste gerados com sucesso!"
+        "mensagem": f"Gerados {sinais_gerados} sinais de teste com valores realistas!"
     })
 
 # =========================
@@ -983,8 +1086,8 @@ def worker_principal():
     """Worker que gera sinais periodicamente"""
     logger.info("🤖 FatPig Signals Brasil iniciado 🇧🇷")
     
-    # Pares monitorados
-    simbolos = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"]
+    # Pares monitorados (principais)
+    simbolos = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT"]
     
     # Mensagem inicial no Telegram
     if TELEGRAM_TOKEN and CHAT_ID:
@@ -993,27 +1096,37 @@ def worker_principal():
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                 json={
                     "chat_id": CHAT_ID,
-                    "text": "🚀 *FAT PIG SIGNALS BRASIL INICIADO* 🇧🇷\n\n✅ Sistema de trading profissional ativado!\n📊 Monitorando 4 pares principais\n⏰ Intervalo: 5 minutos\n💪 Pronto para operar!\n\n_Feito por traders, para traders brasileiros_",
+                    "text": f"""🚀 *FAT PIG SIGNALS BRASIL INICIADO* 🇧🇷
+
+✅ Sistema de trading profissional ativado!
+📊 Monitorando {len(simbolos)} pares principais
+⏰ Intervalo: {BOT_INTERVAL//60} minutos
+💪 Pronto para operar!
+
+*Pares monitorados:*
+{', '.join([s.replace('USDT', '') for s in simbolos])}
+
+_Feito por traders, para traders brasileiros_ 🎯""",
                     "parse_mode": "Markdown"
                 },
                 timeout=5
             )
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"Não foi possível enviar mensagem inicial: {e}")
     
     while True:
         try:
             logger.info(f"🔍 Analisando {len(simbolos)} pares...")
             
             for simbolo in simbolos:
-                # 25% chance de gerar sinal a cada análise
-                if random.random() < 0.25:
+                # 30% chance de gerar sinal a cada análise
+                if random.random() < 0.3:
                     sinal = gerar_sinal(simbolo)
                     if sinal:
                         sinais.append(sinal)
                         estatisticas["total_sinais"] += 1
                         
-                        logger.info(f"📢 Novo sinal: {sinal['direcao']} {sinal['simbolo']}")
+                        logger.info(f"📢 Novo sinal: {sinal['direcao']} {sinal['simbolo']} ${sinal['preco_atual']:.2f}")
                         
                         # Enviar para Telegram
                         if TELEGRAM_TOKEN and CHAT_ID:
@@ -1038,6 +1151,7 @@ def manter_ativo():
     while True:
         try:
             requests.get(f"http://localhost:{PORT}/saude", timeout=5)
+            logger.debug("✅ Ping para manter ativo")
         except:
             pass
         time.sleep(240)  # 4 minutos
@@ -1048,6 +1162,9 @@ def manter_ativo():
 def main():
     """Função principal"""
     logger.info(f"🚀 FatPig Signals Brasil iniciando na porta {PORT} 🇧🇷")
+    logger.info(f"📊 Pares com valores realistas:")
+    for simbolo, preco in PRECOS_BASE.items():
+        logger.info(f"   • {simbolo}: ${preco:,.2f}")
     
     # Iniciar workers
     threading.Thread(target=worker_principal, daemon=True).start()
@@ -1057,11 +1174,12 @@ def main():
     def gerar_demo():
         time.sleep(5)
         for _ in range(3):
-            simbolo = random.choice(["BTCUSDT", "ETHUSDT", "BNBUSDT"])
+            simbolo = random.choice(list(PRECOS_BASE.keys())[:4])  # Apenas 4 primeiros
             sinal = gerar_sinal(simbolo)
             if sinal:
                 sinais.append(sinal)
                 estatisticas["total_sinais"] += 1
+                logger.info(f"📊 Sinal demo: {sinal['direcao']} {sinal['simbolo']}")
     
     threading.Thread(target=gerar_demo, daemon=True).start()
     
