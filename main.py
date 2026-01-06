@@ -29,8 +29,12 @@ CHAT_ID = os.getenv("CHAT_ID", "")
 BOT_INTERVAL = int(os.getenv("BOT_INTERVAL", "300"))  # 5 minutos
 PORT = int(os.getenv("PORT", "10000"))
 
-# Inicializar Exchange (Binance)
-exchange = ccxt.binance({
+# Inicializar Exchange (Bybit - Melhor para o Render)
+exchange = ccxt.bybit({
+    'enableRateLimit': True,
+    'options': {'defaultType': 'spot'}
+})
+
     'enableRateLimit': True,
     'options': {'defaultType': 'spot'}
 })
