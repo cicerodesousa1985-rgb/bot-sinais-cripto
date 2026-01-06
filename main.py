@@ -1,241 +1,196 @@
-# =========================
-# IMPORTS
-# =========================
-import os
-import time
-import threading
-import requests
 import random
-import logging
-import sqlite3
+import threading
+import time
+from collections import deque
 from datetime import datetime
 from flask import Flask, jsonify, render_template_string
-from collections import deque
-from threading import Lock
-python
-Copiar código
-# =========================
-# CONFIGURAÇÕES
-# =========================
+
 app = Flask(__name__)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-CHAT_ID = os.getenv("CHAT_ID", "")
-BOT_INTERVAL = int(os.getenv("BOT_INTERVAL", "300"))
-PORT = int(os.getenv("PORT", "10000"))
+# ===================== DASHBOARD =====================
 
-MODO_DEMO = True
-CACHE_PRECO_SEGUNDOS = 60
-DB_FILE = "winrate.db"
-python
-Copiar código
-# =========================
-# LOG
-# =========================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
-python
-Copiar código
-# =========================
-# BANCO DE DADOS
-# =========================
-def init_db():
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS sinais (
-            id TEXT PRIMARY KEY,
-            simbolo TEXT,
-            direcao TEXT,
-            preco REAL,
-            resultado TEXT,
-            profit REAL,
-            timestamp TEXT
-        )
-        """)
-init_db()
-python
-Copiar código
-# =========================
-# CACHE DE PREÇOS
-# =========================
-precos_cache = {}
+DASHBOARD_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="UTF-8">
+<title>Dashboard de Sinais</title>
+<style>
+body { font-family: Arial; background:#0f172a; color:#e5e7eb; margin:20px }
+.card { background:#020617; padding:15px; border-radius:10px; margin-bottom:10px }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:10px }
+h1 { margin-bottom:10px }
+.win { color:#22c55e }
+.loss { color:#ef4444 }
+</style>
+</head>
+<body>
 
-def buscar_preco_real(simbolo):
-    agora = time.time()
-    if simbolo in precos_cache:
-        preco, ts = precos_cache[simbolo]
-        if agora - ts < CACHE_PRECO_SEGUNDOS:
-            return preco
+<h1>📊 Dashboard de Sinais</h1>
 
-    try:
-        mapa = {
-            "BTCUSDT": "bitcoin",
-            "ETHUSDT": "ethereum",
-            "BNBUSDT": "binancecoin",
-            "SOLUSDT": "solana",
-        }
-        coin = mapa.get(simbolo)
-        if coin:
-            r = requests.get(
-                f"https://api.coingecko.com/api/v3/simple/price?ids={coin}&vs_currencies=usd",
-                timeout=10
-            )
-            if r.status_code == 200:
-                preco = float(r.json()[coin]["usd"])
-                precos_cache[simbolo] = (preco, agora)
-                return preco
-    except:
-        pass
+<div class="grid">
+  <div class="card">Total sinais: <b id="total"></b></div>
+  <div class="card">Winrate: <b id="winrate"></b></div>
+  <div class="card">Winrate hoje: <b id="winrate_hoje"></b></div>
+  <div class="card">Profit: <b id="profit"></b></div>
+  <div class="card">Em aberto: <b id="abertos"></b></div>
+  <div class="card">Melhor sequência: <b id="melhor"></b></div>
+  <div class="card">Pior sequência: <b id="pior"></b></div>
+</div>
 
-    return 100.0
-python
-Copiar código
-# =========================
-# SISTEMA DE WINRATE (THREAD SAFE + SQLITE)
-# =========================
+<h2>📜 Histórico</h2>
+<div id="historico"></div>
+
+<script>
+async function atualizar(){
+  const r = await fetch('/api/estatisticas');
+  const d = await r.json();
+
+  total.innerText = d.total_sinais;
+  winrate.innerText = d.winrate_formatado;
+  winrate_hoje.innerText = d.winrate_hoje_formatado;
+  profit.innerText = d.profit_total_formatado;
+  abertos.innerText = d.sinais_em_aberto;
+  melhor.innerText = d.melhor_sequencia;
+  pior.innerText = d.pior_sequencia;
+
+  const h = await fetch('/api/historico');
+  const hist = await h.json();
+  historico.innerHTML = '';
+  hist.reverse().forEach(s=>{
+    historico.innerHTML += `
+      <div class="card">
+        ${s.ativo} | ${s.direcao} |
+        <span class="${s.resultado==='WIN'?'win':'loss'}">${s.resultado || 'ABERTO'}</span>
+        | ${s.profit}
+      </div>`;
+  })
+}
+
+setInterval(atualizar, 2000);
+atualizar();
+</script>
+
+</body>
+</html>
+"""
+
+# ===================== SISTEMA =====================
+
 class SistemaWinrate:
     def __init__(self):
-        self.lock = Lock()
+        self.lock = threading.Lock()
         self.sinais = deque(maxlen=100)
-        self.stats = {
-            "total": 0,
-            "wins": 0,
-            "loss": 0,
-            "profit": 0.0
+        self.est = {
+            "total_sinais": 0,
+            "sinais_vencedores": 0,
+            "sinais_perdedores": 0,
+            "winrate": 0.0,
+            "profit_total": 0.0,
+            "melhor_sequencia": 0,
+            "pior_sequencia": 0,
+            "sinais_hoje": 0,
+            "winrate_hoje": 0.0
         }
-        self.carregar_db()
 
-    def carregar_db(self):
-        with sqlite3.connect(DB_FILE) as conn:
-            rows = conn.execute("SELECT * FROM sinais").fetchall()
-            for r in rows:
-                self.stats["total"] += 1
-                if r[3] == "WIN":
-                    self.stats["wins"] += 1
-                elif r[3] == "LOSS":
-                    self.stats["loss"] += 1
-                self.stats["profit"] += r[4] or 0
-
-    def adicionar(self, sinal):
+    def novo_sinal(self):
         with self.lock:
+            sinal = {
+                "id": int(time.time()*1000),
+                "ativo": random.choice(["BTCUSDT","ETHUSDT","EURUSD"]),
+                "direcao": random.choice(["CALL","PUT"]),
+                "timestamp": datetime.now().isoformat(),
+                "resultado": None,
+                "profit": 0.0
+            }
             self.sinais.append(sinal)
-            self.stats["total"] += 1
+            self.est["total_sinais"] += 1
+            return sinal
 
-    def fechar(self, sinal, resultado, profit):
+    def fechar_sinal(self, sinal):
         with self.lock:
-            sinal["resultado"] = resultado
-            sinal["profit"] = profit
+            win = random.choice([True, False])
+            profit = random.uniform(1,4) if win else random.uniform(-4,-1)
 
-            if resultado == "WIN":
-                self.stats["wins"] += 1
+            sinal["resultado"] = "WIN" if win else "LOSS"
+            sinal["profit"] = round(profit,2)
+
+            if win:
+                self.est["sinais_vencedores"] += 1
             else:
-                self.stats["loss"] += 1
+                self.est["sinais_perdedores"] += 1
 
-            self.stats["profit"] += profit
+            self.est["profit_total"] += profit
+            self._recalcular()
 
-            with sqlite3.connect(DB_FILE) as conn:
-                conn.execute(
-                    "INSERT OR REPLACE INTO sinais VALUES (?,?,?,?,?,?)",
-                    (
-                        sinal["id"],
-                        sinal["simbolo"],
-                        sinal["direcao"],
-                        resultado,
-                        profit,
-                        datetime.now().isoformat()
-                    )
-                )
-python
-Copiar código
-    def estatisticas(self):
-        total_fechado = self.stats["wins"] + self.stats["loss"]
-        winrate = (self.stats["wins"] / total_fechado * 100) if total_fechado else 0
-        return {
-            "winrate": winrate,
-            "winrate_formatado": f"{winrate:.1f}%",
-            "profit_total": self.stats["profit"],
-            "profit_total_formatado": f"{self.stats['profit']:+.2f}",
-            "sinais_vencedores": self.stats["wins"],
-            "sinais_perdedores": self.stats["loss"],
-            "total_fechados": total_fechado,
-            "sinais_em_aberto": self.stats["total"] - total_fechado,
-            "ultima_atualizacao": datetime.now().strftime("%H:%M:%S")
-        }
+    def _recalcular(self):
+        fechados = self.est["sinais_vencedores"] + self.est["sinais_perdedores"]
+        if fechados:
+            self.est["winrate"] = self.est["sinais_vencedores"] / fechados * 100
 
-    def historico(self, n=20):
+        hoje = datetime.now().date()
+        sinais_hoje = [s for s in self.sinais if datetime.fromisoformat(s["timestamp"]).date()==hoje]
+        fechados_hoje = [s for s in sinais_hoje if s["resultado"]]
+        self.est["sinais_hoje"] = len(sinais_hoje)
+
+        if fechados_hoje:
+            wins = sum(1 for s in fechados_hoje if s["resultado"]=="WIN")
+            self.est["winrate_hoje"] = wins/len(fechados_hoje)*100
+
+        seq=melhor=pior=0
+        for s in self.sinais:
+            if s["resultado"]=="WIN":
+                seq = seq+1 if seq>=0 else 1
+            elif s["resultado"]=="LOSS":
+                seq = seq-1 if seq<=0 else -1
+            melhor=max(melhor,seq)
+            pior=min(pior,seq)
+
+        self.est["melhor_sequencia"]=melhor
+        self.est["pior_sequencia"]=abs(pior)
+
+    def stats(self):
         with self.lock:
-            return list(self.sinais)[-n:]
-python
-Copiar código
+            return {
+                **self.est,
+                "winrate_formatado": f"{self.est['winrate']:.1f}%",
+                "winrate_hoje_formatado": f"{self.est['winrate_hoje']:.1f}%",
+                "profit_total_formatado": f"${self.est['profit_total']:+.2f}",
+                "sinais_em_aberto": self.est["total_sinais"]-(self.est["sinais_vencedores"]+self.est["sinais_perdedores"])
+            }
+
+    def historico(self):
+        with self.lock:
+            return list(self.sinais)
+
 sistema = SistemaWinrate()
-python
-Copiar código
-# =========================
-# GERADOR DE SINAL
-# =========================
-def gerar_sinal(simbolo):
-    preco = buscar_preco_real(simbolo)
-    direcao = random.choice(["COMPRA", "VENDA"])
 
-    sinal = {
-        "id": f"{simbolo}_{int(time.time())}_{random.randint(1000,9999)}",
-        "simbolo": simbolo,
-        "direcao": direcao,
-        "preco_atual": preco,
-        "hora": datetime.now().strftime("%H:%M"),
-        "resultado": None,
-        "profit": None
-    }
+# ===================== THREAD =====================
 
-    sistema.adicionar(sinal)
+def simulador():
+    while True:
+        s = sistema.novo_sinal()
+        time.sleep(random.randint(5,10))
+        sistema.fechar_sinal(s)
+        time.sleep(random.randint(5,10))
 
-    if MODO_DEMO:
-        def simular():
-            time.sleep(random.randint(20, 60))
-            win = random.random() < 0.7
-            resultado = "WIN" if win else "LOSS"
-            profit = random.uniform(2, 6) if win else -random.uniform(1, 4)
-            sistema.fechar(sinal, resultado, profit)
+threading.Thread(target=simulador, daemon=True).start()
 
-        threading.Thread(target=simular, daemon=True).start()
+# ===================== ROTAS =====================
 
-    return sinal
-python
-Copiar código
-# =========================
-# ROTAS
-# =========================
 @app.route("/")
-def dashboard():
-    return render_template_string(
-        DASHBOARD_TEMPLATE,
-        ultimos_sinais=sistema.historico(6),
-        historico_sinais=sistema.historico(20),
-        winrate_stats=sistema.estatisticas()
-    )
+def index():
+    return render_template_string(DASHBOARD_TEMPLATE)
 
 @app.route("/api/estatisticas")
-def api_stats():
-    return jsonify(sistema.estatisticas())
-python
-Copiar código
-# =========================
-# WORKER
-# =========================
-def worker():
-    logger.info("🤖 Bot ativo")
-    simbolos = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"]
-    while True:
-        for s in simbolos:
-            if random.random() < 0.25:
-                gerar_sinal(s)
-            time.sleep(1)
-        time.sleep(BOT_INTERVAL)
-python
-Copiar código
-# =========================
-# MAIN
-# =========================
+def estatisticas():
+    return jsonify(sistema.stats())
+
+@app.route("/api/historico")
+def historico():
+    return jsonify(sistema.historico())
+
+# ===================== START =====================
+
 if __name__ == "__main__":
-    threading.Thread(target=worker, daemon=True).start()
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+    app.run(debug=True, threaded=True)
