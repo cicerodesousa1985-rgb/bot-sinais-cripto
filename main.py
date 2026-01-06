@@ -1,17 +1,19 @@
+# =========================
+# IMPORTS
+# =========================
 import os
 import time
 import threading
 import requests
-import json
+import random
+import logging
 from datetime import datetime
 from flask import Flask, jsonify, render_template_string
-import logging
 from collections import deque
-import random
 from threading import Lock
 
 # =========================
-# CONFIGURAÇÕES GERAIS
+# CONFIGURAÇÕES
 # =========================
 app = Flask(__name__)
 
@@ -40,8 +42,8 @@ def buscar_preco_real(simbolo):
     agora = time.time()
 
     if simbolo in precos_cache:
-        preco, timestamp = precos_cache[simbolo]
-        if agora - timestamp < CACHE_PRECO_SEGUNDOS:
+        preco, ts = precos_cache[simbolo]
+        if agora - ts < CACHE_PRECO_SEGUNDOS:
             return preco
 
     try:
@@ -52,7 +54,7 @@ def buscar_preco_real(simbolo):
             "SOLUSDT": "solana",
             "XRPUSDT": "ripple",
             "ADAUSDT": "cardano",
-            "DOGEUSDT": "dogecoin"
+            "DOGEUSDT": "dogecoin",
         }
 
         coin = mapa.get(simbolo)
@@ -62,7 +64,7 @@ def buscar_preco_real(simbolo):
                 timeout=10
             )
             if r.status_code == 200:
-                preco = r.json()[coin]["usd"]
+                preco = float(r.json()[coin]["usd"])
                 precos_cache[simbolo] = (preco, agora)
                 return preco
     except:
@@ -109,14 +111,14 @@ class SistemaWinrate:
                         self.stats["profit"] -= abs(profit)
                     break
 
-    def get_stats(self):
+    def estatisticas(self):
         with self.lock:
             total_fechado = self.stats["wins"] + self.stats["loss"]
             winrate = (self.stats["wins"] / total_fechado * 100) if total_fechado else 0
             return {
                 "total_sinais": self.stats["total"],
-                "wins": self.stats["wins"],
-                "loss": self.stats["loss"],
+                "sinais_vencedores": self.stats["wins"],
+                "sinais_perdedores": self.stats["loss"],
                 "winrate": winrate,
                 "winrate_formatado": f"{winrate:.1f}%",
                 "profit_total": self.stats["profit"],
@@ -130,7 +132,7 @@ class SistemaWinrate:
 sistema = SistemaWinrate()
 
 # =========================
-# GERADOR DE SINAL
+# GERADOR DE SINAIS
 # =========================
 def gerar_sinal(simbolo):
     preco = buscar_preco_real(simbolo)
@@ -140,24 +142,24 @@ def gerar_sinal(simbolo):
         "id": f"{simbolo}_{int(time.time())}_{random.randint(1000,9999)}",
         "simbolo": simbolo,
         "direcao": direcao,
-        "preco": round(preco, 2),
+        "preco_atual": round(preco, 2),
         "hora": datetime.now().strftime("%H:%M"),
         "resultado": None,
-        "profit": 0.0,
+        "profit": None,
         "simulado": MODO_SIMULACAO
     }
 
     sistema.adicionar(sinal)
 
-    def simular():
-        time.sleep(random.randint(10, 30))
+    def simular_resultado():
+        time.sleep(random.randint(15, 40))
         if MODO_SIMULACAO:
             win = random.random() < WINRATE_SIMULADO
             resultado = "WIN" if win else "LOSS"
             profit = random.uniform(2, 6) if win else random.uniform(1, 4)
             sistema.fechar(sinal["id"], resultado, profit)
 
-    threading.Thread(target=simular, daemon=True).start()
+    threading.Thread(target=simular_resultado, daemon=True).start()
     return sinal
 
 # =========================
@@ -167,34 +169,83 @@ def enviar_telegram(sinal):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         return
 
-    aviso = "⚠️ *SINAL SIMULADO (DEMO)*\n" if MODO_SIMULACAO else ""
+    aviso = "⚠️ *SINAL SIMULADO (DEMO)*\n\n" if MODO_SIMULACAO else ""
     texto = f"""{aviso}
 📊 *{sinal['direcao']}* {sinal['simbolo']}
-💰 Preço: ${sinal['preco']}
+💰 Preço: ${sinal['preco_atual']}
 ⏰ Hora: {sinal['hora']}
 """
 
-    requests.post(
-        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-        json={"chat_id": CHAT_ID, "text": texto, "parse_mode": "Markdown"},
-        timeout=10
-    )
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": texto, "parse_mode": "Markdown"},
+            timeout=10
+        )
+    except:
+        pass
+
+# =========================
+# DASHBOARD (SIMPLIFICADO, FUNCIONAL)
+# =========================
+DASHBOARD = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>FatPig Signals</title>
+    <meta http-equiv="refresh" content="30">
+    <style>
+        body { font-family: Arial; background:#111; color:#eee; padding:20px }
+        .card { background:#1e1e1e; padding:15px; border-radius:10px; margin-bottom:15px }
+        .win { color:#00ff88 }
+        .loss { color:#ff4757 }
+    </style>
+</head>
+<body>
+<h1>📊 FAT PIG SIGNALS</h1>
+<p>Modo: <b>{{ modo }}</b></p>
+
+<div class="card">
+    <h2>Winrate</h2>
+    <p>{{ stats.winrate_formatado }}</p>
+    <p>Profit: {{ stats.profit_total_formatado }}</p>
+</div>
+
+<div class="card">
+<h2>Últimos sinais</h2>
+{% for s in sinais %}
+<p>
+{{ s.hora }} | {{ s.simbolo }} | {{ s.direcao }}
+{% if s.resultado %}
+- <span class="{{ 'win' if s.resultado=='WIN' else 'loss' }}">
+{{ s.resultado }} {{ s.profit|round(1) }}%
+</span>
+{% else %}
+- ABERTO
+{% endif %}
+</p>
+{% endfor %}
+</div>
+</body>
+</html>
+"""
 
 # =========================
 # ROTAS
 # =========================
 @app.route("/")
 def home():
-    return jsonify({
-        "stats": sistema.get_stats(),
-        "ultimos_sinais": sistema.historico(10),
-        "modo": "SIMULAÇÃO" if MODO_SIMULACAO else "REAL"
-    })
+    return render_template_string(
+        DASHBOARD,
+        stats=sistema.estatisticas(),
+        sinais=sistema.historico(10),
+        modo="SIMULAÇÃO" if MODO_SIMULACAO else "REAL"
+    )
 
 @app.route("/gerar")
 def gerar():
-    simbolos = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"]
-    s = gerar_sinal(random.choice(simbolos))
+    simbolo = random.choice(["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"])
+    s = gerar_sinal(simbolo)
     enviar_telegram(s)
     return jsonify(s)
 
@@ -204,7 +255,6 @@ def gerar():
 def worker():
     logger.info("🤖 Bot iniciado")
     simbolos = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"]
-
     while True:
         for s in simbolos:
             if random.random() < 0.3:
