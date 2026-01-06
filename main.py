@@ -35,16 +35,11 @@ exchange = ccxt.bybit({
     'options': {'defaultType': 'spot'}
 })
 
-    'enableRateLimit': True,
-    'options': {'defaultType': 'spot'}
-})
-
 # =========================
 # ANÁLISE TÉCNICA REAL
 # =========================
 
 def calcular_rsi(series, period=14):
-    """Calcula o RSI real usando pandas"""
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
@@ -52,7 +47,6 @@ def calcular_rsi(series, period=14):
     return 100 - (100 / (1 + rs))
 
 def calcular_macd(series, fast=12, slow=26, signal=9):
-    """Calcula o MACD real usando pandas"""
     exp1 = series.ewm(span=fast, adjust=False).mean()
     exp2 = series.ewm(span=slow, adjust=False).mean()
     macd = exp1 - exp2
@@ -60,7 +54,6 @@ def calcular_macd(series, fast=12, slow=26, signal=9):
     return macd, signal_line
 
 def obter_dados_mercado(symbol, timeframe='1h', limit=100):
-    """Busca dados OHLCV reais da exchange"""
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -159,12 +152,10 @@ sistema_winrate = SistemaWinrate()
 # =========================
 
 def gerar_sinal_real(symbol):
-    """Gera sinal baseado em indicadores reais"""
     df = obter_dados_mercado(symbol)
     if df is None or len(df) < 30:
         return None
 
-    # Calcular indicadores
     df['rsi'] = calcular_rsi(df['close'])
     df['macd'], df['macd_signal'] = calcular_macd(df['close'])
     
@@ -176,7 +167,6 @@ def gerar_sinal_real(symbol):
     direcao = None
     motivo = ""
     
-    # Estratégia: RSI + Cruzamento MACD
     if ultimo_rsi < 30:
         direcao = "COMPRA"
         motivo = f"RSI Sobrevendido ({ultimo_rsi:.1f})"
@@ -193,7 +183,6 @@ def gerar_sinal_real(symbol):
     if not direcao:
         return None
 
-    # Definir Alvos e Stop (Baseado em volatilidade simples)
     volatilidade = df['close'].pct_change().std()
     if direcao == "COMPRA":
         entrada = preco_atual
@@ -228,23 +217,16 @@ def gerar_sinal_real(symbol):
     }
     
     sinal_completo = sistema_winrate.adicionar_sinal(sinal)
-    
-    # Iniciar monitoramento real do sinal
     threading.Thread(target=monitorar_sinal_real, args=(sinal_completo,), daemon=True).start()
-    
     return sinal_completo
 
 def monitorar_sinal_real(sinal):
-    """Monitora o preço real para validar o sinal (Take Profit ou Stop Loss)"""
     symbol = sinal["simbolo"]
     id_sinal = sinal["id"]
     tp1 = sinal["alvos"][0]
     stop = sinal["stop_loss"]
     direcao = sinal["direcao"]
     
-    logger.info(f"👀 Monitorando sinal {id_sinal} para {symbol}")
-    
-    # Monitorar por até 4 horas
     tempo_limite = datetime.now() + timedelta(hours=4)
     
     while datetime.now() < tempo_limite:
@@ -256,42 +238,29 @@ def monitorar_sinal_real(sinal):
                 if preco_atual >= tp1:
                     profit = ((tp1 / sinal["entrada"]) - 1) * 100
                     sistema_winrate.atualizar_resultado(id_sinal, "WIN", profit)
-                    logger.info(f"✅ WIN: {symbol} atingiu TP1")
                     return
                 elif preco_atual <= stop:
                     profit = ((stop / sinal["entrada"]) - 1) * 100
                     sistema_winrate.atualizar_resultado(id_sinal, "LOSS", profit)
-                    logger.info(f"❌ LOSS: {symbol} atingiu Stop Loss")
                     return
-            else: # VENDA
+            else:
                 if preco_atual <= tp1:
                     profit = (1 - (tp1 / sinal["entrada"])) * 100
                     sistema_winrate.atualizar_resultado(id_sinal, "WIN", profit)
-                    logger.info(f"✅ WIN: {symbol} atingiu TP1")
                     return
                 elif preco_atual >= stop:
                     profit = (1 - (stop / sinal["entrada"])) * 100
                     sistema_winrate.atualizar_resultado(id_sinal, "LOSS", profit)
-                    logger.info(f"❌ LOSS: {symbol} atingiu Stop Loss")
                     return
-                    
-            time.sleep(30) # Verificar a cada 30 segundos
-        except Exception as e:
-            logger.error(f"Erro ao monitorar {symbol}: {e}")
+            time.sleep(30)
+        except:
             time.sleep(60)
             
-    # Se expirar sem atingir TP ou SL
     try:
         ticker = exchange.fetch_ticker(symbol)
         preco_final = ticker['last']
-        if direcao == "COMPRA":
-            profit = ((preco_final / sinal["entrada"]) - 1) * 100
-        else:
-            profit = (1 - (preco_final / sinal["entrada"])) * 100
-        
-        resultado = "WIN" if profit > 0 else "LOSS"
-        sistema_winrate.atualizar_resultado(id_sinal, resultado, profit)
-        logger.info(f"⏱️ EXPIRADO: {symbol} fechado por tempo. Resultado: {resultado}")
+        profit = ((preco_final / sinal["entrada"]) - 1) * 100 if direcao == "COMPRA" else (1 - (preco_final / sinal["entrada"])) * 100
+        sistema_winrate.atualizar_resultado(id_sinal, "WIN" if profit > 0 else "LOSS", profit)
     except:
         sistema_winrate.atualizar_resultado(id_sinal, "LOSS", -1.0)
 
@@ -302,7 +271,6 @@ def monitorar_sinal_real(sinal):
 def enviar_telegram_sinal(sinal):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         return False
-    
     emoji = "🟢" if sinal["direcao"] == "COMPRA" else "🔴"
     mensagem = f"""
 {emoji} *{sinal['direcao']} REAL* - {sinal['simbolo']}
@@ -317,61 +285,151 @@ def enviar_telegram_sinal(sinal):
 🏆 *Winrate Real:* {sistema_winrate.estatisticas['winrate']:.1f}%
     """
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": CHAT_ID, "text": mensagem, "parse_mode": "Markdown"}, timeout=10)
-    except Exception as e:
-        logger.error(f"Erro Telegram: {e}")
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": CHAT_ID, "text": mensagem, "parse_mode": "Markdown"}, timeout=10)
+    except:
+        pass
 
 # =========================
-# DASHBOARD (Simplificado para o exemplo)
+# DASHBOARD (ESTILO FAT PIG SIGNALS)
 # =========================
 
 DASHBOARD_TEMPLATE = '''
 <!DOCTYPE html>
-<html>
+<html lang="pt-BR">
 <head>
-    <title>Crypto Bot V2 - Real Analysis</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fat Pig Signals - Dashboard Pro</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
-        body { font-family: sans-serif; background: #121212; color: white; padding: 20px; }
-        .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 20px; }
-        .card { background: #1e1e1e; padding: 15px; border-radius: 8px; text-align: center; border: 1px solid #333; }
-        .win { color: #00ff88; }
-        .loss { color: #ff4757; }
-        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #333; }
-        th { background: #252525; }
+        :root {
+            --primary: #f5a623;
+            --bg: #0b0e11;
+            --card-bg: #1e2329;
+            --text: #eaecef;
+            --text-muted: #848e9c;
+            --success: #0ecb81;
+            --danger: #f6465d;
+        }
+        
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; }
+        
+        .header { 
+            background: #000; 
+            padding: 20px 5%; 
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center;
+            border-bottom: 2px solid var(--primary);
+        }
+        
+        .logo { font-size: 24px; font-weight: 900; color: var(--primary); text-transform: uppercase; letter-spacing: 2px; }
+        .logo span { color: #fff; }
+        
+        .container { max-width: 1200px; margin: 40px auto; padding: 0 20px; }
+        
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin-bottom: 40px; }
+        .stat-card { background: var(--card-bg); padding: 30px; border-radius: 12px; text-align: center; border: 1px solid #2b3139; transition: transform 0.3s; }
+        .stat-card:hover { transform: translateY(-5px); border-color: var(--primary); }
+        .stat-value { font-size: 32px; font-weight: 800; margin-bottom: 5px; }
+        .stat-label { color: var(--text-muted); font-size: 14px; text-transform: uppercase; letter-spacing: 1px; }
+        
+        .signals-section { background: var(--card-bg); border-radius: 16px; overflow: hidden; border: 1px solid #2b3139; }
+        .section-header { padding: 20px 30px; background: #161a1e; border-bottom: 1px solid #2b3139; display: flex; justify-content: space-between; align-items: center; }
+        
+        table { width: 100%; border-collapse: collapse; }
+        th { text-align: left; padding: 20px 30px; color: var(--text-muted); font-size: 12px; text-transform: uppercase; border-bottom: 1px solid #2b3139; }
+        td { padding: 20px 30px; border-bottom: 1px solid #2b3139; font-size: 14px; }
+        
+        .badge { padding: 6px 12px; border-radius: 6px; font-weight: 600; font-size: 12px; }
+        .badge-buy { background: rgba(14, 203, 129, 0.15); color: var(--success); }
+        .badge-sell { background: rgba(246, 70, 93, 0.15); color: var(--danger); }
+        .badge-win { background: var(--success); color: #000; }
+        .badge-loss { background: var(--danger); color: #fff; }
+        .badge-open { background: #474d57; color: #fff; }
+        
+        .profit-pos { color: var(--success); font-weight: bold; }
+        .profit-neg { color: var(--danger); font-weight: bold; }
+        
+        .footer { text-align: center; padding: 40px; color: var(--text-muted); font-size: 12px; }
+        
+        @media (max-width: 768px) {
+            .stats-grid { grid-template-columns: 1fr; }
+            th:nth-child(4), td:nth-child(4), th:nth-child(5), td:nth-child(5) { display: none; }
+        }
     </style>
 </head>
 <body>
-    <h1>🚀 Crypto Signals Bot V2 (Real Data)</h1>
-    <div class="stats">
-        <div class="card"><h3>Winrate</h3><h2 class="win">{{ stats.winrate_formatado }}</h2></div>
-        <div class="card"><h3>Sinais Hoje</h3><h2>{{ stats.sinais_hoje }}</h2></div>
-        <div class="card"><h3>Profit Total</h3><h2 class="{{ 'win' if stats.profit_total >= 0 else 'loss' }}">{{ stats.profit_total_formatado }}</h2></div>
-        <div class="card"><h3>Em Aberto</h3><h2>{{ stats.sinais_em_aberto }}</h2></div>
+    <div class="header">
+        <div class="logo">FAT PIG <span>SIGNALS</span></div>
+        <div style="color: var(--success); font-size: 12px;"><i class="fas fa-circle"></i> SISTEMA ATIVO</div>
     </div>
     
-    <h2>Últimos Sinais</h2>
-    <table>
-        <tr>
-            <th>Par</th>
-            <th>Direção</th>
-            <th>Entrada</th>
-            <th>Resultado</th>
-            <th>Profit</th>
-            <th>Status</th>
-        </tr>
-        {% for s in sinais %}
-        <tr>
-            <td>{{ s.simbolo }}</td>
-            <td class="{{ 'win' if s.direcao == 'COMPRA' else 'loss' }}">{{ s.direcao }}</td>
-            <td>${{ s.entrada }}</td>
-            <td class="{{ 'win' if s.resultado == 'WIN' else 'loss' }}">{{ s.resultado or '-' }}</td>
-            <td class="{{ 'win' if s.profit > 0 else 'loss' }}">{{ s.profit|round(2) }}%</td>
-            <td>{{ s.status }}</td>
-        </tr>
-        {% endfor %}
-    </table>
+    <div class="container">
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-value" style="color: var(--primary)">{{ stats.winrate_formatado }}</div>
+                <div class="stat-label">Winrate Global</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">{{ stats.sinais_hoje }}</div>
+                <div class="stat-label">Sinais Hoje</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value {{ 'profit-pos' if stats.profit_total >= 0 else 'profit-neg' }}">{{ stats.profit_total_formatado }}</div>
+                <div class="stat-label">Profit Acumulado</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">{{ stats.sinais_em_aberto }}</div>
+                <div class="stat-label">Operações em Aberto</div>
+            </div>
+        </div>
+        
+        <div class="signals-section">
+            <div class="section-header">
+                <h2 style="font-size: 18px;"><i class="fas fa-bolt" style="color: var(--primary)"></i> ÚLTIMOS SINAIS REAIS</h2>
+                <span style="font-size: 12px; color: var(--text-muted)">Atualizado em tempo real</span>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Par</th>
+                        <th>Direção</th>
+                        <th>Entrada</th>
+                        <th>Resultado</th>
+                        <th>Profit</th>
+                        <th>Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for s in sinais %}
+                    <tr>
+                        <td style="font-weight: bold;">{{ s.simbolo }}</td>
+                        <td><span class="badge {{ 'badge-buy' if s.direcao == 'COMPRA' else 'badge-sell' }}">{{ s.direcao }}</span></td>
+                        <td>${{ "{:,.2f}".format(s.entrada) }}</td>
+                        <td>
+                            {% if s.resultado %}
+                                <span class="badge {{ 'badge-win' if s.resultado == 'WIN' else 'badge-loss' }}">{{ s.resultado }}</span>
+                            {% else %}
+                                <span class="badge badge-open">AGUARDANDO</span>
+                            {% endif %}
+                        </td>
+                        <td class="{{ 'profit-pos' if s.profit > 0 else 'profit-neg' if s.profit < 0 else '' }}">
+                            {{ s.profit|round(2) }}%
+                        </td>
+                        <td style="color: var(--text-muted); font-size: 12px;">{{ s.status }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    
+    <div class="footer">
+        &copy; 2026 FAT PIG SIGNALS - ALGORITMO DE ANÁLISE TÉCNICA PRO<br>
+        <span style="opacity: 0.5">Este dashboard é apenas para fins educacionais e de monitoramento.</span>
+    </div>
 </body>
 </html>
 '''
@@ -384,23 +442,17 @@ def dashboard():
         sinais=sistema_winrate.get_historico(20)[::-1]
     )
 
-# =========================
-# WORKER E MAIN
-# =========================
-
 def worker_principal():
-    logger.info("🤖 Bot V2 Iniciado com Dados Reais")
-    simbolos = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT"]
-    
+    logger.info("🤖 Bot V3 Iniciado - Estilo Fat Pig Signals")
+    simbolos = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT", "DOGE/USDT"]
     while True:
         try:
             for symbol in simbolos:
                 sinal = gerar_sinal_real(symbol)
                 if sinal:
-                    logger.info(f"📢 Novo sinal real gerado: {sinal['direcao']} {symbol}")
+                    logger.info(f"📢 Novo sinal real: {sinal['direcao']} {symbol}")
                     enviar_telegram_sinal(sinal)
                 time.sleep(2)
-            
             time.sleep(BOT_INTERVAL)
         except Exception as e:
             logger.error(f"Erro no worker: {e}")
