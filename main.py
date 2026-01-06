@@ -21,34 +21,23 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
-BOT_INTERVAL = int(os.getenv("BOT_INTERVAL", "300"))
+BOT_INTERVAL = int(os.getenv("BOT_INTERVAL", "180")) # Reduzido para 3 min para mais sinais
 PORT = int(os.getenv("PORT", "10000"))
 
-# Inicializar Exchange (Bybit)
 exchange = ccxt.bybit({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
+DB_PATH = "bot_signals_v5.db"
 
 # =========================
-# BANCO DE DADOS (PERSISTÊNCIA)
+# BANCO DE DADOS
 # =========================
-DB_PATH = "bot_signals.db"
-
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS sinais (
-            id TEXT PRIMARY KEY,
-            simbolo TEXT,
-            direcao TEXT,
-            entrada REAL,
-            tp1 REAL,
-            stop REAL,
-            motivo TEXT,
-            resultado TEXT,
-            profit REAL,
-            status TEXT,
-            timestamp DATETIME,
-            timestamp_fechamento DATETIME
+            id TEXT PRIMARY KEY, simbolo TEXT, direcao TEXT, entrada REAL, tp1 REAL, stop REAL, 
+            estrategia TEXT, motivo TEXT, resultado TEXT, profit REAL, status TEXT, 
+            timestamp DATETIME, timestamp_fechamento DATETIME
         )
     ''')
     conn.commit()
@@ -58,26 +47,17 @@ def salvar_sinal_db(s):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''
-        INSERT OR REPLACE INTO sinais (id, simbolo, direcao, entrada, tp1, stop, motivo, resultado, profit, status, timestamp, timestamp_fechamento)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (s['id'], s['simbolo'], s['direcao'], s['entrada'], s['alvos'][0], s['stop_loss'], s['motivo'], s.get('resultado'), s.get('profit', 0.0), s['status'], s['timestamp'], s.get('timestamp_fechamento')))
+        INSERT OR REPLACE INTO sinais (id, simbolo, direcao, entrada, tp1, stop, estrategia, motivo, resultado, profit, status, timestamp, timestamp_fechamento)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (s['id'], s['simbolo'], s['direcao'], s['entrada'], s['alvos'][0], s['stop_loss'], s['estrategia'], s['motivo'], s.get('resultado'), s.get('profit', 0.0), s['status'], s['timestamp'], s.get('timestamp_fechamento')))
     conn.commit()
     conn.close()
-
-def carregar_estatisticas_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*), SUM(CASE WHEN resultado='WIN' THEN 1 ELSE 0 END), SUM(profit) FROM sinais WHERE status='FECHADO'")
-    total, wins, profit = cursor.fetchone()
-    conn.close()
-    return total or 0, wins or 0, profit or 0.0
 
 init_db()
 
 # =========================
-# INDICADORES TÉCNICOS PRO
+# INDICADORES TÉCNICOS AVANÇADOS
 # =========================
-
 def calcular_indicadores(df):
     # RSI
     delta = df['close'].diff()
@@ -85,7 +65,9 @@ def calcular_indicadores(df):
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     df['rsi'] = 100 - (100 / (1 + (gain / loss)))
     
-    # EMA 200 (Tendência de Longo Prazo)
+    # Médias Móveis (Cruzamento)
+    df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
+    df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
     df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
     
     # Bandas de Bollinger
@@ -94,243 +76,191 @@ def calcular_indicadores(df):
     df['upper_band'] = df['sma20'] + (df['std20'] * 2)
     df['lower_band'] = df['sma20'] - (df['std20'] * 2)
     
-    # MACD
-    exp1 = df['close'].ewm(span=12, adjust=False).mean()
-    exp2 = df['close'].ewm(span=26, adjust=False).mean()
-    df['macd'] = exp1 - exp2
-    df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+    # Volume (Média de Volume)
+    df['vol_avg'] = df['volume'].rolling(window=20).mean()
+    
+    # ATR (Para Stop Loss Dinâmico)
+    high_low = df['high'] - df['low']
+    high_close = np.abs(df['high'] - df['close'].shift())
+    low_close = np.abs(df['low'] - df['close'].shift())
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    true_range = np.max(ranges, axis=1)
+    df['atr'] = true_range.rolling(14).mean()
     
     return df
 
-def obter_fear_and_greed():
-    try:
-        r = requests.get("https://api.alternative.me/fng/", timeout=5)
-        data = r.json()
-        return data['data'][0]['value'], data['data'][0]['value_classification']
-    except:
-        return "50", "Neutral"
-
 # =========================
-# SISTEMA DE WINRATE ATUALIZADO
+# MÚLTIPLAS ESTRATÉGIAS
 # =========================
 
-class SistemaWinrate:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.atualizar_cache()
-
-    def atualizar_cache(self):
-        total, wins, profit = carregar_estatisticas_db()
-        self.estatisticas = {
-            "total_fechados": total,
-            "sinais_vencedores": wins,
-            "profit_total": profit,
-            "winrate": (wins / total * 100) if total > 0 else 0.0,
-            "ultima_atualizacao": datetime.now().strftime("%H:%M:%S")
-        }
-
-    def adicionar_sinal(self, sinal):
-        sinal_completo = {**sinal, "resultado": None, "timestamp_fechamento": None, "profit": 0.0, "status": "ABERTO"}
-        salvar_sinal_db(sinal_completo)
-        return sinal_completo
-
-    def atualizar_resultado(self, sinal_id, resultado, profit):
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE sinais SET resultado=?, profit=?, status='FECHADO', timestamp_fechamento=? WHERE id=?
-        ''', (resultado, profit, datetime.now().isoformat(), sinal_id))
-        conn.commit()
-        conn.close()
-        self.atualizar_cache()
-        
-        # Notificar fechamento no Telegram
-        self.notificar_fechamento_telegram(sinal_id, resultado, profit)
-
-    def notificar_fechamento_telegram(self, sinal_id, resultado, profit):
-        if not TELEGRAM_TOKEN or not CHAT_ID: return
-        emoji = "✅ PROFIT" if resultado == "WIN" else "❌ STOP"
-        msg = f"{emoji} *Operação Encerrada*\nID: `{sinal_id}`\nResultado: *{resultado}*\nLucro/Perda: `{profit:.2f}%`"
-        try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
-        except: pass
-
-    def get_estatisticas(self):
-        self.atualizar_cache()
-        fng_val, fng_class = obter_fear_and_greed()
-        return {
-            **self.estatisticas,
-            "winrate_formatado": f"{self.estatisticas['winrate']:.1f}%",
-            "profit_total_formatado": f"{self.estatisticas['profit_total']:+.2f}%",
-            "fng_value": fng_val,
-            "fng_class": fng_class
-        }
-
-    def get_historico(self, limite=15):
-        conn = sqlite3.connect(DB_PATH)
-        df = pd.read_sql_query(f"SELECT * FROM sinais ORDER BY timestamp DESC LIMIT {limite}", conn)
-        conn.close()
-        return df.to_dict('records')
-
-sistema_winrate = SistemaWinrate()
-
-# =========================
-# LÓGICA DE SINAIS AVANÇADA
-# =========================
-
-def gerar_sinal_real(symbol):
-    ohlcv = exchange.fetch_ohlcv(symbol, '1h', limit=200)
-    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df = calcular_indicadores(df)
-    
+def analisar_estrategias(df, symbol):
     last = df.iloc[-1]
     prev = df.iloc[-2]
     preco = last['close']
-    
-    direcao = None
-    motivo = ""
-    
-    # ESTRATÉGIA PRO: Tendência (EMA200) + Reversão (Bollinger/RSI)
-    if preco > last['ema200']: # Tendência de Alta
-        if last['rsi'] < 35 and last['close'] <= last['lower_band']:
-            direcao = "COMPRA"
-            motivo = "Reversão na Banda Inferior (Tendência Alta)"
-        elif last['macd'] > last['macd_signal'] and prev['macd'] <= prev['macd_signal']:
-            direcao = "COMPRA"
-            motivo = "Cruzamento MACD (Tendência Alta)"
-    else: # Tendência de Baixa
-        if last['rsi'] > 65 and last['close'] >= last['upper_band']:
-            direcao = "VENDA"
-            motivo = "Reversão na Banda Superior (Tendência Baixa)"
-        elif last['macd'] < last['macd_signal'] and prev['macd'] >= prev['macd_signal']:
-            direcao = "VENDA"
-            motivo = "Cruzamento MACD (Tendência Baixa)"
+    sinais = []
 
-    if not direcao: return None
+    # 1. ESTRATÉGIA: CRUZAMENTO DE MÉDIAS (TENDÊNCIA)
+    if last['ema9'] > last['ema21'] and prev['ema9'] <= prev['ema21'] and preco > last['ema200']:
+        sinais.append({"direcao": "COMPRA", "estrategia": "GOLDEN CROSS", "motivo": "Cruzamento EMA 9/21 (Alta)"})
+    elif last['ema9'] < last['ema21'] and prev['ema9'] >= prev['ema21'] and preco < last['ema200']:
+        sinais.append({"direcao": "VENDA", "estrategia": "DEATH CROSS", "motivo": "Cruzamento EMA 9/21 (Baixa)"})
 
-    vol = df['close'].pct_change().std()
-    tp = preco * (1 + vol * 2) if direcao == "COMPRA" else preco * (1 - vol * 2)
-    sl = preco * (1 - vol * 2) if direcao == "COMPRA" else preco * (1 + vol * 2)
+    # 2. ESTRATÉGIA: REVERSÃO DE BANDAS + RSI (SCALPING)
+    if last['close'] <= last['lower_band'] and last['rsi'] < 30:
+        sinais.append({"direcao": "COMPRA", "estrategia": "BOLLINGER REVERSAL", "motivo": "Preço abaixo da Banda + RSI Sobrevendido"})
+    elif last['close'] >= last['upper_band'] and last['rsi'] > 70:
+        sinais.append({"direcao": "VENDA", "estrategia": "BOLLINGER REVERSAL", "motivo": "Preço acima da Banda + RSI Sobrecomprado"})
 
-    sinal = {
-        "id": f"{symbol.replace('/', '')}_{int(time.time())}",
-        "simbolo": symbol, "direcao": direcao, "entrada": round(preco, 4),
-        "alvos": [round(tp, 4)], "stop_loss": round(sl, 4), "motivo": motivo,
-        "timestamp": datetime.now().isoformat(), "status": "ABERTO"
-    }
-    
-    sinal_completo = sistema_winrate.adicionar_sinal(sinal)
-    threading.Thread(target=monitorar_sinal, args=(sinal_completo,), daemon=True).start()
-    
-    # Notificar Telegram
-    if TELEGRAM_TOKEN and CHAT_ID:
-        emoji = "🟢" if direcao == "COMPRA" else "🔴"
-        msg = f"{emoji} *NOVO SINAL PRO*\nPar: `{symbol}`\nDireção: *{direcao}*\nEntrada: `{preco}`\nAlvo: `{tp:.4f}`\nStop: `{sl:.4f}`\n💡 {motivo}"
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
-    
-    return sinal_completo
+    # 3. ESTRATÉGIA: BREAKOUT DE VOLUME
+    if last['volume'] > (last['vol_avg'] * 2):
+        if last['close'] > prev['high'] and last['rsi'] > 50:
+            sinais.append({"direcao": "COMPRA", "estrategia": "VOLUME BREAKOUT", "motivo": "Rompimento com Volume Alto"})
+        elif last['close'] < prev['low'] and last['rsi'] < 50:
+            sinais.append({"direcao": "VENDA", "estrategia": "VOLUME BREAKOUT", "motivo": "Queda com Volume Alto"})
+
+    return sinais
+
+# =========================
+# GERADOR DE SINAIS V5
+# =========================
+
+def processar_sinais(symbol):
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, '15m', limit=200) # Timeframe menor para mais sinais
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df = calcular_indicadores(df)
+        
+        oportunidades = analisar_estrategias(df, symbol)
+        
+        for op in oportunidades:
+            # Evitar sinais duplicados para o mesmo par no mesmo minuto
+            sinal_id = f"{symbol.replace('/', '')}_{int(time.time()) // 60}"
+            
+            # Verificar se já existe sinal recente no DB
+            conn = sqlite3.connect(DB_PATH)
+            check = conn.execute("SELECT id FROM sinais WHERE id=?", (sinal_id,)).fetchone()
+            conn.close()
+            if check: continue
+
+            preco = df.iloc[-1]['close']
+            atr = df.iloc[-1]['atr']
+            
+            # Alvos baseados em ATR (mais precisos)
+            tp = preco + (atr * 2) if op['direcao'] == "COMPRA" else preco - (atr * 2)
+            sl = preco - (atr * 1.5) if op['direcao'] == "COMPRA" else preco + (atr * 1.5)
+
+            sinal = {
+                "id": sinal_id, "simbolo": symbol, "direcao": op['direcao'], 
+                "entrada": round(preco, 4), "alvos": [round(tp, 4)], "stop_loss": round(sl, 4),
+                "estrategia": op['estrategia'], "motivo": op['motivo'],
+                "timestamp": datetime.now().isoformat(), "status": "ABERTO"
+            }
+            
+            salvar_sinal_db(sinal)
+            threading.Thread(target=monitorar_sinal, args=(sinal,), daemon=True).start()
+            notificar_telegram(sinal)
+            
+    except Exception as e:
+        logger.error(f"Erro ao processar {symbol}: {e}")
 
 def monitorar_sinal(sinal):
     symbol, id_sinal, tp, sl, direcao = sinal["simbolo"], sinal["id"], sinal["alvos"][0], sinal["stop_loss"], sinal["direcao"]
-    for _ in range(480): # 4 horas (check a cada 30s)
+    for _ in range(240): # 2 horas de monitoramento
         try:
             p = exchange.fetch_ticker(symbol)['last']
             if (direcao == "COMPRA" and p >= tp) or (direcao == "VENDA" and p <= tp):
-                sistema_winrate.atualizar_resultado(id_sinal, "WIN", abs((tp/sinal['entrada']-1)*100))
+                finalizar_sinal(id_sinal, "WIN", abs((tp/sinal['entrada']-1)*100))
                 return
             if (direcao == "COMPRA" and p <= sl) or (direcao == "VENDA" and p >= sl):
-                sistema_winrate.atualizar_resultado(id_sinal, "LOSS", -abs((sl/sinal['entrada']-1)*100))
+                finalizar_sinal(id_sinal, "LOSS", -abs((sl/sinal['entrada']-1)*100))
                 return
             time.sleep(30)
         except: time.sleep(60)
+    
     # Fechamento por tempo
-    p = exchange.fetch_ticker(symbol)['last']
-    profit = ((p/sinal['entrada']-1)*100) if direcao == "COMPRA" else (1-p/sinal['entrada'])*100
-    sistema_winrate.atualizar_resultado(id_sinal, "WIN" if profit > 0 else "LOSS", profit)
+    try:
+        p = exchange.fetch_ticker(symbol)['last']
+        profit = ((p/sinal['entrada']-1)*100) if direcao == "COMPRA" else (1-p/sinal['entrada'])*100
+        finalizar_sinal(id_sinal, "WIN" if profit > 0 else "LOSS", profit)
+    except: pass
+
+def finalizar_sinal(sinal_id, resultado, profit):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE sinais SET resultado=?, profit=?, status='FECHADO', timestamp_fechamento=? WHERE id=?", 
+                (resultado, profit, datetime.now().isoformat(), sinal_id))
+    conn.commit()
+    conn.close()
+    
+    if TELEGRAM_TOKEN and CHAT_ID:
+        emoji = "💰" if resultado == "WIN" else "📉"
+        msg = f"{emoji} *SINAL ENCERRADO*\nID: `{sinal_id}`\nResultado: *{resultado}*\nProfit: `{profit:.2f}%`"
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+
+def notificar_telegram(s):
+    if not TELEGRAM_TOKEN or not CHAT_ID: return
+    emoji = "🚀" if s['direcao'] == "COMPRA" else "📉"
+    msg = f"{emoji} *NOVO SINAL [{s['estrategia']}]*\nPar: `{s['simbolo']}`\nDireção: *{s['direcao']}*\nEntrada: `{s['entrada']}`\nAlvo: `{s['alvos'][0]}`\nStop: `{s['stop_loss']}`\n💡 {s['motivo']}"
+    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
 
 # =========================
-# DASHBOARD V4 (FAT PIG SIGNALS PRO)
+# DASHBOARD V5
 # =========================
 
 DASHBOARD_TEMPLATE = '''
 <!DOCTYPE html>
-<html lang="pt-BR">
+<html>
 <head>
     <meta charset="UTF-8">
-    <title>Fat Pig Signals V4 - Pro Dashboard</title>
+    <title>Fat Pig Signals V5 - Multi-Strategy</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
         :root { --primary: #f5a623; --bg: #0b0e11; --card: #1e2329; --text: #eaecef; --success: #0ecb81; --danger: #f6465d; }
         body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); margin: 0; }
         .header { background: #000; padding: 15px 5%; display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid var(--primary); }
-        .container { max-width: 1300px; margin: 30px auto; padding: 0 20px; }
-        .top-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 30px; }
+        .container { max-width: 1400px; margin: 20px auto; padding: 0 20px; }
+        .stats-bar { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; margin-bottom: 25px; }
         .card { background: var(--card); padding: 20px; border-radius: 10px; text-align: center; border: 1px solid #2b3139; }
-        .fng-badge { padding: 5px 15px; border-radius: 20px; font-weight: bold; font-size: 12px; margin-top: 10px; display: inline-block; }
-        .grid-main { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; }
-        .signals-table { background: var(--card); border-radius: 12px; overflow: hidden; border: 1px solid #2b3139; }
+        .signals-grid { display: grid; grid-template-columns: 1fr; gap: 20px; }
+        .table-container { background: var(--card); border-radius: 12px; overflow: hidden; border: 1px solid #2b3139; }
         table { width: 100%; border-collapse: collapse; }
         th, td { padding: 15px; text-align: left; border-bottom: 1px solid #2b3139; font-size: 13px; }
-        .chart-container { background: var(--card); padding: 15px; border-radius: 12px; border: 1px solid #2b3139; height: 450px; }
-        .badge { padding: 4px 8px; border-radius: 4px; font-weight: bold; font-size: 11px; }
-        .buy { color: var(--success); background: rgba(14,203,129,0.1); }
-        .sell { color: var(--danger); background: rgba(246,70,93,0.1); }
+        .badge-strat { background: var(--primary); color: #000; padding: 3px 8px; border-radius: 4px; font-size: 10px; font-weight: bold; }
+        .buy { color: var(--success); } .sell { color: var(--danger); }
     </style>
 </head>
 <body>
     <div class="header">
-        <div style="font-weight: 900; color: var(--primary); font-size: 20px;">FAT PIG <span style="color:#fff">SIGNALS V4</span></div>
-        <div style="font-size: 12px;"><i class="fas fa-database"></i> DATABASE: ACTIVE</div>
+        <div style="font-weight: 900; color: var(--primary); font-size: 22px;">FAT PIG <span style="color:#fff">V5 MULTI-STRAT</span></div>
+        <div style="font-size: 12px; color: var(--success);"><i class="fas fa-bolt"></i> SCANNING MARKET...</div>
     </div>
     <div class="container">
-        <div class="top-stats">
-            <div class="card"><div style="color:var(--primary); font-size:24px; font-weight:800;">{{ stats.winrate_formatado }}</div><div style="font-size:11px; color:#848e9c;">WINRATE GLOBAL</div></div>
-            <div class="card"><div style="font-size:24px; font-weight:800;">{{ stats.total_fechados }}</div><div style="font-size:11px; color:#848e9c;">SINAIS ENCERRADOS</div></div>
-            <div class="card"><div style="font-size:24px; font-weight:800; color:{{ '#0ecb81' if stats.profit_total >= 0 else '#f6465d' }}">{{ stats.profit_total_formatado }}</div><div style="font-size:11px; color:#848e9c;">PROFIT TOTAL</div></div>
-            <div class="card">
-                <div style="font-size:20px; font-weight:800;">{{ stats.fng_value }}</div>
-                <div class="fng-badge" style="background: {{ '#0ecb81' if 'Greed' in stats.fng_class else '#f6465d' if 'Fear' in stats.fng_class else '#f5a623' }}">
-                    {{ stats.fng_class }}
-                </div>
-                <div style="font-size:10px; color:#848e9c; margin-top:5px;">FEAR & GREED INDEX</div>
-            </div>
+        <div class="stats-bar">
+            <div class="card"><div style="color:var(--primary); font-size:24px; font-weight:800;">{{ stats.winrate }}%</div><div style="font-size:11px;">WINRATE</div></div>
+            <div class="card"><div style="font-size:24px; font-weight:800;">{{ stats.total }}</div><div style="font-size:11px;">SINAIS TOTAIS</div></div>
+            <div class="card"><div style="font-size:24px; font-weight:800; color:var(--success)">{{ stats.profit }}%</div><div style="font-size:11px;">PROFIT ACUMULADO</div></div>
+            <div class="card"><div style="font-size:24px; font-weight:800;">{{ stats.abertos }}</div><div style="font-size:11px;">EM ABERTO</div></div>
         </div>
-        <div class="grid-main">
-            <div class="signals-table">
-                <div style="padding:15px; background:#161a1e; font-weight:bold; border-bottom:1px solid #2b3139;">
-                    <i class="fas fa-list"></i> HISTÓRICO DE SINAIS (PERSISTENTE)
-                </div>
-                <table>
-                    <thead><tr><th>Par</th><th>Direção</th><th>Entrada</th><th>Resultado</th><th>Profit</th><th>Status</th></tr></thead>
-                    <tbody>
-                        {% for s in sinais %}
-                        <tr>
-                            <td><b>{{ s.simbolo }}</b></td>
-                            <td><span class="badge {{ 'buy' if s.direcao == 'COMPRA' else 'sell' }}">{{ s.direcao }}</span></td>
-                            <td>${{ s.entrada }}</td>
-                            <td>{{ s.resultado or '-' }}</td>
-                            <td style="color:{{ '#0ecb81' if s.profit > 0 else '#f6465d' if s.profit < 0 else '#fff' }}">{{ s.profit|round(2) }}%</td>
-                            <td>{{ s.status }}</td>
-                        </tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
+        <div class="table-container">
+            <div style="padding:15px; background:#161a1e; font-weight:bold; display:flex; justify-content:space-between;">
+                <span><i class="fas fa-satellite-dish"></i> MONITORAMENTO MULTI-ESTRATÉGIA</span>
+                <span style="font-size:11px; color:#848e9c;">Timeframe: 15m / 1h</span>
             </div>
-            <div class="chart-container">
-                <div style="font-weight:bold; margin-bottom:10px;"><i class="fas fa-chart-area"></i> LIVE MARKET (BTC/USDT)</div>
-                <!-- TradingView Widget BEGIN -->
-                <div class="tradingview-widget-container" style="height: 400px;">
-                  <div id="tradingview_chart"></div>
-                  <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
-                  <script type="text/javascript">
-                  new TradingView.widget({
-                    "autosize": true, "symbol": "BYBIT:BTCUSDT", "interval": "60", "timezone": "Etc/UTC",
-                    "theme": "dark", "style": "1", "locale": "br", "toolbar_bg": "#f1f3f6",
-                    "enable_publishing": false, "hide_top_toolbar": true, "save_image": false,
-                    "container_id": "tradingview_chart"
-                  });
-                  </script>
-                </div>
-            </div>
+            <table>
+                <thead><tr><th>Par</th><th>Estratégia</th><th>Direção</th><th>Entrada</th><th>Resultado</th><th>Profit</th><th>Motivo</th></tr></thead>
+                <tbody>
+                    {% for s in sinais %}
+                    <tr>
+                        <td><b>{{ s.simbolo }}</b></td>
+                        <td><span class="badge-strat">{{ s.estrategia }}</span></td>
+                        <td class="{{ 'buy' if s.direcao == 'COMPRA' else 'sell' }}"><b>{{ s.direcao }}</b></td>
+                        <td>${{ s.entrada }}</td>
+                        <td>{{ s.resultado or 'ABERTO' }}</td>
+                        <td style="color:{{ '#0ecb81' if s.profit > 0 else '#f6465d' if s.profit < 0 else '#fff' }}">{{ s.profit|round(2) }}%</td>
+                        <td style="font-size:11px; color:#848e9c;">{{ s.motivo }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
         </div>
     </div>
 </body>
@@ -339,19 +269,26 @@ DASHBOARD_TEMPLATE = '''
 
 @app.route('/')
 def dashboard():
-    return render_template_string(DASHBOARD_TEMPLATE, stats=sistema_winrate.get_estatisticas(), sinais=sistema_winrate.get_historico())
+    conn = sqlite3.connect(DB_PATH)
+    sinais = pd.read_sql_query("SELECT * FROM sinais ORDER BY timestamp DESC LIMIT 30", conn).to_dict('records')
+    stats_raw = conn.execute("SELECT COUNT(*), SUM(CASE WHEN resultado='WIN' THEN 1 ELSE 0 END), SUM(profit) FROM sinais WHERE status='FECHADO'").fetchone()
+    abertos = conn.execute("SELECT COUNT(*) FROM sinais WHERE status='ABERTO'").fetchone()[0]
+    conn.close()
+    
+    total = stats_raw[0] or 0
+    wins = stats_raw[1] or 0
+    profit = stats_raw[2] or 0.0
+    
+    stats = {"total": total, "winrate": round((wins/total*100),1) if total > 0 else 0, "profit": round(profit,2), "abertos": abertos}
+    return render_template_string(DASHBOARD_TEMPLATE, stats=stats, sinais=sinais)
 
 def worker():
-    simbolos = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT"]
+    simbolos = ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT", "DOGE/USDT", "DOT/USDT", "MATIC/USDT", "LINK/USDT"]
     while True:
-        try:
-            for s in simbolos:
-                gerar_sinal_real(s)
-                time.sleep(5)
-            time.sleep(BOT_INTERVAL)
-        except Exception as e:
-            logger.error(f"Worker Error: {e}")
-            time.sleep(60)
+        for s in simbolos:
+            processar_sinais(s)
+            time.sleep(3)
+        time.sleep(BOT_INTERVAL)
 
 if __name__ == '__main__':
     threading.Thread(target=worker, daemon=True).start()
