@@ -8,3 +8,4 @@ psutil==5.9.5
 gunicorn==20.1.0
 ccxt
 numpy
+python-binance
