@@ -1,7 +1,6 @@
 import os
 import time
 import threading
-import requests
 import logging
 import random
 from datetime import datetime
@@ -16,26 +15,32 @@ import pandas as pd
 app = Flask(__name__)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("FatPig")
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-CHAT_ID = os.getenv("CHAT_ID", "")
 PORT = int(os.getenv("PORT", "10000"))
 BOT_INTERVAL = 300  # 5 minutos
 
-# Binance
-client = Client(os.getenv('BINANCE_API_KEY'), os.getenv('BINANCE_API_SECRET'))
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 
-# Símbolos que o bot vai operar
+client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"]
 
-# Config trading
-MARGIN_PER_TRADE = 1.0  # US$1
-TP_PERCENT = 0.02       # +2%
-SL_PERCENT = 0.01       # -1%
-PRECISION = {"BTCUSDT": 3, "ETHUSDT": 3, "BNBUSDT": 2, "SOLUSDT": 1}
+MARGIN_PER_TRADE = 1.0
+TP_PERCENT = 0.02
+SL_PERCENT = 0.01
 
-# Setup inicial Binance
+PRECISION = {
+    "BTCUSDT": 3,
+    "ETHUSDT": 3,
+    "BNBUSDT": 2,
+    "SOLUSDT": 1
+}
+
+# =========================
+# SETUP BINANCE
+# =========================
 for sym in SYMBOLS:
     try:
         client.futures_change_margin_type(symbol=sym, marginType='ISOLATED')
@@ -43,205 +48,200 @@ for sym in SYMBOLS:
         pass
 
 # =========================
-# WINRATE REAL DA BINANCE
+# WINRATE REAL (PNL BINANCE)
 # =========================
 class SistemaWinrate:
     def __init__(self):
+        self.cache = None
         self.cache_time = 0
-        self.cached = None
 
     def get_estatisticas(self):
         now = time.time()
-        if self.cached and (now - self.cache_time) < 30:
-            return self.cached
+        if self.cache and now - self.cache_time < 30:
+            return self.cache
 
         try:
-            all_trades = []
+            trades_all = []
             for sym in SYMBOLS:
-                trades = client.futures_account_trade_list(symbol=sym, limit=500)
-                all_trades.extend(trades)
+                trades_all += client.futures_account_trade_list(symbol=sym, limit=500)
 
-            if not all_trades:
-                stats = self.fallback()
-                self.cached = stats
-                self.cache_time = now
-                return stats
+            if not trades_all:
+                return self._fallback()
 
-            df = pd.DataFrame(all_trades)
-            df['pnl'] = pd.to_numeric(df['realizedPnl'], errors='coerce')
-            df = df[df['pnl'] != 0].copy()
-            df['time'] = pd.to_datetime(df['time'], unit='ms')
+            df = pd.DataFrame(trades_all)
+            df["pnl"] = pd.to_numeric(df["realizedPnl"], errors="coerce")
+            df = df[df["pnl"] != 0]
+            df["time"] = pd.to_datetime(df["time"], unit="ms")
+
+            total = len(df)
+            wins = len(df[df["pnl"] > 0])
+            losses = total - wins
+            winrate = (wins / total * 100) if total else 0
+            profit = df["pnl"].sum()
 
             hoje = datetime.now().date()
-            df_hoje = df[df['time'].dt.date == hoje]
-
-            wins = len(df[df['pnl'] > 0])
-            total = len(df)
-            wins_hoje = len(df_hoje[df_hoje['pnl'] > 0])
+            df_hoje = df[df["time"].dt.date == hoje]
             total_hoje = len(df_hoje)
-            winrate = (wins / total * 100) if total > 0 else 0.0
-            winrate_hoje = (wins_hoje / total_hoje * 100) if total_hoje > 0 else 0.0
-            profit = df['pnl'].sum()
+            wins_hoje = len(df_hoje[df_hoje["pnl"] > 0])
+            winrate_hoje = (wins_hoje / total_hoje * 100) if total_hoje else 0
 
             stats = {
-                "total_sinais": total,
-                "sinais_vencedores": wins,
-                "sinais_perdedores": total - wins,
-                "winrate": winrate,
-                "profit_total": profit,
-                "melhor_sequencia": 8,
-                "pior_sequencia": 3,
-                "sinais_hoje": total_hoje,
-                "winrate_hoje": winrate_hoje,
-                "ultima_atualizacao": datetime.now().strftime("%H:%M:%S"),
-                "winrate_formatado": f"{winrate:.1f}%",
-                "winrate_hoje_formatado": f"{winrate_hoje:.1f}%",
-                "profit_total_formatado": f"${profit:+.2f}",
                 "total_fechados": total,
-                "sinais_em_aberto": max(1, len(SYMBOLS))
+                "sinais_vencedores": wins,
+                "sinais_perdedores": losses,
+                "winrate": winrate,
+                "winrate_formatado": f"{winrate:.1f}%",
+                "profit_total": profit,
+                "profit_total_formatado": f"${profit:+.2f}",
+                "sinais_hoje": total_hoje,
+                "winrate_hoje_formatado": f"{winrate_hoje:.1f}%",
+                "ultima_atualizacao": datetime.now().strftime("%d/%m/%Y %H:%M:%S")
             }
-        except:
-            stats = self.fallback()
 
-        self.cached = stats
+        except Exception as e:
+            logger.error(e)
+            stats = self._fallback()
+
+        self.cache = stats
         self.cache_time = now
         return stats
 
-    def fallback(self):
+    def _fallback(self):
         return {
-            "total_sinais": 0, "sinais_vencedores": 0, "sinais_perdedores": 0,
-            "winrate": 0.0, "profit_total": 0.0, "melhor_sequencia": 0, "pior_sequencia": 0,
-            "sinais_hoje": 0, "winrate_hoje": 0.0,
-            "ultima_atualizacao": datetime.now().strftime("%H:%M:%S"),
-            "winrate_formatado": "0.0%", "winrate_hoje_formatado": "0.0%",
-            "profit_total_formatado": "$0.00", "total_fechados": 0, "sinais_em_aberto": 0
+            "total_fechados": 0,
+            "sinais_vencedores": 0,
+            "sinais_perdedores": 0,
+            "winrate": 0,
+            "winrate_formatado": "0.0%",
+            "profit_total": 0,
+            "profit_total_formatado": "$0.00",
+            "sinais_hoje": 0,
+            "winrate_hoje_formatado": "0.0%",
+            "ultima_atualizacao": datetime.now().strftime("%d/%m/%Y %H:%M:%S")
         }
-
-    def get_historico(self, limite=20):
-        return []  # Mantém vazio pra não quebrar o layout
 
 sistema_winrate = SistemaWinrate()
 
 # =========================
-# PREÇO REAL
+# TRADE REAL FUTURES
 # =========================
-def buscar_preco_real(simbolo):
-    try:
-        return float(client.futures_mark_price(symbol=simbolo)['markPrice'])
-    except:
-        return 60000.0 if simbolo == "BTCUSDT" else 3000.0
+def preco(simbolo):
+    return float(client.futures_mark_price(symbol=simbolo)["markPrice"])
 
-# =========================
-# EXECUÇÃO DE TRADE REAL
-# =========================
 def executar_trade(simbolo, direcao):
     try:
         positions = client.futures_position_information(symbol=simbolo)
-        if any(float(p['positionAmt']) != 0 for p in positions):
-            return  # Já tem posição
+        if any(float(p["positionAmt"]) != 0 for p in positions):
+            return
 
-        # Winrate real e alavancagem
-        trades = client.futures_account_trade_list(symbol=simbolo, limit=100)
-        closed = [t for t in trades if float(t['realizedPnl']) != 0]
-        winrate = sum(1 for t in closed if float(t['realizedPnl']) > 0) / len(closed) if closed else 0.5
-        leverage = max(1, min(10, int(round(winrate * 10))))
+        trades = client.futures_account_trade_list(symbol=simbolo, limit=50)
+        fechados = [t for t in trades if float(t["realizedPnl"]) != 0]
+        winrate = sum(1 for t in fechados if float(t["realizedPnl"]) > 0) / len(fechados) if fechados else 0.5
+        leverage = max(1, min(10, int(winrate * 10)))
+
         client.futures_change_leverage(symbol=simbolo, leverage=leverage)
 
-        price = buscar_preco_real(simbolo)
-        quantity = round((MARGIN_PER_TRADE * leverage) / price, PRECISION.get(simbolo, 3))
+        price = preco(simbolo)
+        qty = round((MARGIN_PER_TRADE * leverage) / price, PRECISION[simbolo])
 
         side = SIDE_BUY if direcao == "COMPRA" else SIDE_SELL
-        close_side = SIDE_SELL if direcao == "COMPRA" else SIDE_BUY
+        close_side = SIDE_SELL if side == SIDE_BUY else SIDE_BUY
 
-        # Entrada
-        client.futures_create_order(symbol=simbolo, side=side, type=FUTURE_ORDER_TYPE_MARKET, quantity=quantity)
-        logger.info(f"🚀 TRADE ABERTO: {direcao} {quantity} {simbolo} @ {price:.2f} | {leverage}x")
+        client.futures_create_order(
+            symbol=simbolo,
+            side=side,
+            type=ORDER_TYPE_MARKET,
+            quantity=qty
+        )
 
-        # TP e SL únicos
-        tp_price = price * (1 + TP_PERCENT) if direcao == "COMPRA" else price * (1 - TP_PERCENT)
-        sl_price = price * (1 - SL_PERCENT) if direcao == "COMPRA" else price * (1 + SL_PERCENT)
+        tp = price * (1 + TP_PERCENT if side == SIDE_BUY else 1 - TP_PERCENT)
+        sl = price * (1 - SL_PERCENT if side == SIDE_BUY else 1 + SL_PERCENT)
 
-        client.futures_create_order(symbol=simbolo, side=close_side, type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
-                                    stopPrice=round(tp_price, 2), quantity=quantity, reduceOnly=True)
-        client.futures_create_order(symbol=simbolo, side=close_side, type=FUTURE_ORDER_TYPE_STOP_MARKET,
-                                    stopPrice=round(sl_price, 2), quantity=quantity, reduceOnly=True)
+        client.futures_create_order(
+            symbol=simbolo,
+            side=close_side,
+            type=ORDER_TYPE_TAKE_PROFIT_MARKET,
+            stopPrice=round(tp, 2),
+            closePosition=True
+        )
+
+        client.futures_create_order(
+            symbol=simbolo,
+            side=close_side,
+            type=ORDER_TYPE_STOP_MARKET,
+            stopPrice=round(sl, 2),
+            closePosition=True
+        )
+
+        logger.info(f"TRADE {direcao} {simbolo} {leverage}x")
 
     except Exception as e:
-        logger.error(f"Erro no trade {simbolo}: {e}")
+        logger.error(e)
 
 # =========================
-# WORKER AUTOMÁTICO (roda junto com o dashboard)
+# WORKER
 # =========================
-def worker_trading():
-    logger.info("🤖 FatPig Trader REAL iniciado!")
+def worker():
+    logger.info("🤖 BOT FUTURES ATIVO")
     while True:
-        try:
-            for simbolo in SYMBOLS:
-                if random.random() < 0.25:  # Chance de operar nesse ciclo
-                    direcao = "COMPRA" if random.random() < 0.5 else "VENDA"
-                    executar_trade(simbolo, direcao)
-                time.sleep(5)
-            time.sleep(BOT_INTERVAL)
-        except Exception as e:
-            logger.error(f"Erro no worker: {e}")
-            time.sleep(60)
+        for s in SYMBOLS:
+            if random.random() < 0.25:
+                executar_trade(s, "COMPRA" if random.random() < 0.5 else "VENDA")
+            time.sleep(5)
+        time.sleep(BOT_INTERVAL)
 
 # =========================
-# DASHBOARD TEMPLATE (SEU ORIGINAL 100% IGUAL)
+# DASHBOARD (SEM ERRO)
 # =========================
-DASHBOARD_TEMPLATE = '''
+DASHBOARD_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FatPig Signals - Sistema de Winrate</title>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <style>
-        :root {
-            --verde-brasil: #009c3b;
-            --amarelo-brasil: #ffdf00;
-            --azul-brasil: #002776;
-            --verde-win: #00ff88;
-            --vermelho-loss: #ff4757;
-            --fundo: #0a0a0a;
-            --card: rgba(255, 255, 255, 0.05);
-        }
-        /* TODO O SEU CSS LINDO AQUI - É EXATAMENTE O MESMO QUE VOCÊ COLOU ANTES */
-        /* Eu não repeti tudo pra mensagem não ficar gigante, mas é IDÊNTICO */
-        /* Você já tem ele - só copia do seu código antigo e cola aqui */
-    </style>
+<meta charset="UTF-8">
+<title>FatPig Signals</title>
+<style>
+body{background:#0a0a0a;color:#fff;font-family:Arial}
+.card{background:#111;padding:15px;margin:10px;border-radius:8px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr))}
+h1{color:#00ff88}
+</style>
 </head>
 <body>
-    <!-- TODO O SEU HTML DO DASHBOARD - 100% IGUAL -->
-    <!-- Com header, stats, cards, tabela, footer, JS de auto-refresh, TUDO -->
-    <!-- Copia do seu código original e cola aqui dentro das ''' -->
+<h1>🐷 FatPig Signals – Futures REAL</h1>
+
+<div class="grid">
+  <div class="card">Winrate: {{ winrate_stats.winrate_formatado }}</div>
+  <div class="card">Lucro: {{ winrate_stats.profit_total_formatado }}</div>
+  <div class="card">Hoje: {{ winrate_stats.winrate_hoje_formatado }}</div>
+  <div class="card">Trades: {{ winrate_stats.total_fechados }}</div>
+</div>
+
+<p>Última atualização: {{ winrate_stats.ultima_atualizacao }}</p>
+
+<script>
+setTimeout(()=>location.reload(),30000);
+</script>
 </body>
 </html>
-'''
+"""
 
 # =========================
 # ROTAS
 # =========================
-@app.route('/')
+@app.route("/")
 def dashboard():
     return render_template_string(
         DASHBOARD_TEMPLATE,
-        ultimos_sinais=[],
-        historico_sinais=[],
         winrate_stats=sistema_winrate.get_estatisticas()
     )
 
-@app.route('/api/estatisticas')
-def api_estatisticas():
+@app.route("/api/estatisticas")
+def api_stats():
     return jsonify(sistema_winrate.get_estatisticas())
 
 # =========================
-# MAIN - Inicia dashboard + trading automático
+# MAIN
 # =========================
-if __name__ == '__main__':
-    # Inicia o worker de trading em background
-    threading.Thread(target=worker_trading, daemon=True).start()
-    
-    logger.info(f"🚀 FatPig Signals + Trader REAL rodando na porta {PORT}")
-    app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
+if __name__ == "__main__":
+    threading.Thread(target=worker, daemon=True).start()
+    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
