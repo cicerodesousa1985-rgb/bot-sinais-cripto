@@ -2,12 +2,11 @@ import os
 import time
 import threading
 import requests
-import json
-from datetime import datetime
-from flask import Flask, jsonify, render_template_string
-import logging
-from collections import deque
 import random
+import logging
+from datetime import datetime
+from collections import deque
+from flask import Flask, jsonify, render_template_string
 
 # =========================
 # CONFIGURAÇÃO
@@ -54,41 +53,39 @@ class SistemaWinrate:
 
             self.sinais.append(sinal)
             self.estatisticas["total_sinais"] += 1
-
             self.calcular_estatisticas()
             return sinal
 
     def atualizar_resultado(self, sinal_id, resultado, profit):
         with self.lock:
-            for sinal in self.sinais:
-                if sinal["id"] == sinal_id:
-                    if sinal["resultado"] is not None:
-                        return  # proteção contra duplicação
+            for s in self.sinais:
+                if s["id"] == sinal_id:
+                    if s["resultado"] is not None:
+                        return  # evita duplicação
 
-                    sinal["resultado"] = resultado
-                    sinal["profit"] = round(profit, 2)
-                    sinal["timestamp_fechamento"] = datetime.now().isoformat()
+                    s["resultado"] = resultado
+                    s["profit"] = round(profit, 2)
+                    s["timestamp_fechamento"] = datetime.now().isoformat()
 
                     if resultado == "WIN":
                         self.estatisticas["sinais_vencedores"] += 1
                     else:
                         self.estatisticas["sinais_perdedores"] += 1
 
-                    # PROFIT CORRETO (WIN soma, LOSS já é negativo)
+                    # PROFIT CORRETO (LOSS já é negativo)
                     self.estatisticas["profit_total"] += profit
-
                     self.calcular_estatisticas()
                     return
 
     def calcular_estatisticas(self):
-        total_fechados = (
+        fechados = (
             self.estatisticas["sinais_vencedores"]
             + self.estatisticas["sinais_perdedores"]
         )
 
-        if total_fechados > 0:
+        if fechados > 0:
             self.estatisticas["winrate"] = (
-                self.estatisticas["sinais_vencedores"] / total_fechados
+                self.estatisticas["sinais_vencedores"] / fechados
             ) * 100
 
         hoje = datetime.now().date()
@@ -110,19 +107,14 @@ class SistemaWinrate:
         self.estatisticas["ultima_atualizacao"] = datetime.now().strftime("%H:%M:%S")
 
     def calcular_sequencias(self):
-        melhor = 0
-        pior = 0
-        atual = 0
-
+        melhor, pior, atual = 0, 0, 0
         for s in self.sinais:
             if s["resultado"] == "WIN":
                 atual = atual + 1 if atual >= 0 else 1
             elif s["resultado"] == "LOSS":
                 atual = atual - 1 if atual <= 0 else -1
-
             melhor = max(melhor, atual)
             pior = min(pior, atual)
-
         self.estatisticas["melhor_sequencia"] = melhor
         self.estatisticas["pior_sequencia"] = abs(pior)
 
@@ -131,14 +123,13 @@ class SistemaWinrate:
             self.estatisticas["sinais_vencedores"]
             + self.estatisticas["sinais_perdedores"]
         )
-
         return {
             **self.estatisticas,
             "winrate_formatado": f"{self.estatisticas['winrate']:.1f}%",
             "winrate_hoje_formatado": f"{self.estatisticas['winrate_hoje']:.1f}%",
             "profit_total_formatado": f"{self.estatisticas['profit_total']:+.2f}%",
             "total_fechados": fechados,
-            "sinais_em_aberto": self.estatisticas["total_sinais"] - fechados,
+            "sinais_em_aberto": self.estatisticas["total_sinais"] - fechados
         }
 
     def get_historico(self, limite=20):
@@ -151,15 +142,15 @@ sistema_winrate = SistemaWinrate()
 # PREÇO SIMULADO
 # =========================
 def buscar_preco_real(simbolo):
-    valores = {
+    precos = {
         "BTCUSDT": 43000,
         "ETHUSDT": 2300,
         "BNBUSDT": 320,
         "SOLUSDT": 100,
         "XRPUSDT": 0.6,
-        "ADAUSDT": 0.45
+        "ADAUSDT": 0.45,
     }
-    return valores.get(simbolo, 100)
+    return precos.get(simbolo, 100)
 
 # =========================
 # GERADOR DE SINAIS
@@ -167,10 +158,9 @@ def buscar_preco_real(simbolo):
 def gerar_sinal(simbolo):
     preco = buscar_preco_real(simbolo)
     direcao = random.choice(["COMPRA", "VENDA"])
-    confianca = round(random.uniform(0.6, 0.9), 2)
 
     sinal = {
-        "id": f"{simbolo}_{int(time.time())}",
+        "id": f"{simbolo}_{int(time.time())}_{random.randint(1000,9999)}",
         "simbolo": simbolo,
         "direcao": direcao,
         "forca": random.choice(["FORTE", "MÉDIO", "FRACO"]),
@@ -182,7 +172,7 @@ def gerar_sinal(simbolo):
             round(preco * 1.06, 2)
         ],
         "stop_loss": round(preco * 0.97, 2),
-        "confianca": confianca,
+        "confianca": round(random.uniform(0.6, 0.9), 2),
         "motivo": "Análise Técnica",
         "timestamp": datetime.now().isoformat(),
         "hora": datetime.now().strftime("%H:%M"),
@@ -192,8 +182,8 @@ def gerar_sinal(simbolo):
 
     sistema_winrate.adicionar_sinal(sinal)
 
-    def simular_resultado():
-        time.sleep(random.randint(5, 15))
+    def simular():
+        time.sleep(random.randint(10, 30))
         win = random.random() < 0.7
         profit = random.uniform(2, 6) if win else random.uniform(-4, -1)
         sistema_winrate.atualizar_resultado(
@@ -202,23 +192,40 @@ def gerar_sinal(simbolo):
             profit
         )
 
-    threading.Thread(target=simular_resultado, daemon=True).start()
+    threading.Thread(target=simular, daemon=True).start()
     return sinal
+
+# =========================
+# DASHBOARD (ORIGINAL – SEM ALTERAR VISUAL)
+# =========================
+DASHBOARD_TEMPLATE = """ 
+""" + """ """  # 👈 AQUI ENTRA **EXATAMENTE** O HTML QUE VOCÊ JÁ TEM
+
+# ⚠️ IMPORTANTE:
+# 👉 Cole AQUI o MESMO DASHBOARD_TEMPLATE
+# 👉 NÃO alterei nenhuma linha do HTML/CSS/JS
+# 👉 Ele continua funcionando igual
 
 # =========================
 # ROTAS
 # =========================
 @app.route("/")
 def dashboard():
-    return jsonify({
-        "estatisticas": sistema_winrate.get_estatisticas(),
-        "ultimos_sinais": sistema_winrate.get_historico(10)
-    })
+    return render_template_string(
+        DASHBOARD_TEMPLATE,
+        ultimos_sinais=sistema_winrate.get_historico(6)[::-1],
+        historico_sinais=sistema_winrate.get_historico(20)[::-1],
+        winrate_stats=sistema_winrate.get_estatisticas()
+    )
 
-@app.route("/gerar")
-def gerar():
-    gerar_sinal(random.choice(["BTCUSDT", "ETHUSDT", "BNBUSDT"]))
-    return jsonify({"status": "sinal gerado"})
+@app.route("/api/estatisticas")
+def api_estatisticas():
+    return jsonify(sistema_winrate.get_estatisticas())
+
+@app.route("/gerar-teste")
+def gerar_teste():
+    gerar_sinal(random.choice(["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"]))
+    return jsonify({"status": "ok"})
 
 # =========================
 # WORKER
