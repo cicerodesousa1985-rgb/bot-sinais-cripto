@@ -13,52 +13,60 @@ from binance.client import Client
 from binance.enums import *
 
 # =========================
-# CONFIGURAÇÃO E LOGGING
+# CONFIGURAÇÃO
 # =========================
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Variáveis de Ambiente
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 PORT = int(os.getenv("PORT", "10000"))
 
-# Configurações de Trade
 LEVERAGE = 10
 MARGIN_TYPE = "ISOLATED"
 PARES = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "MATICUSDT", "LINKUSDT", "AVAXUSDT", "DOTUSDT"]
 
-# Inicializar Binance
 try:
     binance_client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
     logger.info("✅ Binance Conectada")
 except:
     binance_client = None
-    logger.warning("⚠️ Binance não conectada")
 
 # =========================
-# SISTEMA DE DADOS
+# SISTEMA DE DADOS E WINRATE
 # =========================
 class BotData:
     def __init__(self):
-        self.sinais = deque(maxlen=20)
+        self.sinais = deque(maxlen=30)
         self.stats = {
             "total": 0,
-            "sucesso_binance": 0,
-            "erros": 0,
+            "wins": 0,
+            "losses": 0,
             "winrate": 0.0,
+            "saldo_real": 0.0,
             "inicio": datetime.now().strftime("%d/%m %H:%M")
         }
     
     def add_sinal(self, sinal):
         self.sinais.append(sinal)
         self.stats["total"] += 1
-        if sinal.get('executado'): self.stats["sucesso_binance"] += 1
-        else: self.stats["erros"] += 1
+        self.atualizar_winrate()
         return sinal
+
+    def atualizar_winrate(self):
+        total_fechados = self.stats["wins"] + self.stats["losses"]
+        if total_fechados > 0:
+            self.stats["winrate"] = (self.stats["wins"] / total_fechados) * 100
+
+    def atualizar_saldo(self):
+        if not binance_client: return
+        try:
+            acc = binance_client.futures_account()
+            self.stats["saldo_real"] = float(acc['totalWalletBalance'])
+        except: pass
 
 bot_data = BotData()
 
@@ -78,16 +86,12 @@ def trade_binance(sinal):
         qty_precision = s_info['quantityPrecision']
         price_precision = s_info['pricePrecision']
 
-        # Valor nominal mínimo de 5.2 USDT para garantir
-        quantidade = round(5.2 / sinal['preco'], qty_precision)
-        
+        quantidade = round(5.5 / sinal['preco'], qty_precision)
         side = SIDE_BUY if sinal['direcao'] == "COMPRA" else SIDE_SELL
         side_inv = SIDE_SELL if sinal['direcao'] == "COMPRA" else SIDE_BUY
 
-        # Ordem Principal
         binance_client.futures_create_order(symbol=simbolo, side=side, type=FUTURE_ORDER_TYPE_MARKET, quantity=quantidade)
         
-        # TP e SL
         tp = round(sinal['tp'], price_precision)
         sl = round(sinal['sl'], price_precision)
         
@@ -102,8 +106,8 @@ def trade_binance(sinal):
 # =========================
 # LÓGICA DE SINAIS
 # =========================
-def gerar_sinal(simbolo=None):
-    if not simbolo: simbolo = random.choice(PARES)
+def gerar_sinal():
+    simbolo = random.choice(PARES)
     try:
         res = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={simbolo}").json()
         preco = float(res['price'])
@@ -114,8 +118,8 @@ def gerar_sinal(simbolo=None):
             "simbolo": simbolo,
             "direcao": direcao,
             "preco": preco,
-            "tp": preco * 1.005 if direcao == "COMPRA" else preco * 0.995,
-            "sl": preco * 0.99 if direcao == "COMPRA" else preco * 1.01,
+            "tp": preco * 1.006 if direcao == "COMPRA" else preco * 0.994,
+            "sl": preco * 0.992 if direcao == "COMPRA" else preco * 1.008,
             "tempo": datetime.now().strftime("%H:%M:%S"),
             "executado": False
         }
@@ -123,6 +127,7 @@ def gerar_sinal(simbolo=None):
         sucesso = trade_binance(sinal)
         sinal['executado'] = sucesso
         bot_data.add_sinal(sinal)
+        bot_data.atualizar_saldo()
         
         if TELEGRAM_TOKEN:
             status = "✅ EXECUTADO" if sucesso else "❌ ERRO/SALDO"
@@ -131,91 +136,91 @@ def gerar_sinal(simbolo=None):
     except: pass
 
 def worker():
-    # Gera sinal imediato ao iniciar
-    gerar_sinal("BTCUSDT")
+    bot_data.atualizar_saldo()
     while True:
         gerar_sinal()
-        time.sleep(180) # A cada 3 minutos um novo sinal
+        time.sleep(300) # 5 minutos entre sinais para gerenciar banca pequena
 
 # =========================
-# DASHBOARD PREMIUM
+# DASHBOARD FINAL
 # =========================
 DASHBOARD_HTML = '''
 <!DOCTYPE html>
 <html>
 <head>
-    <title>FAT PIG PREMIUM</title>
+    <title>FAT PIG - DASHBOARD REAL</title>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <style>
-        body { background: #0f0f0f; color: #e0e0e0; font-family: 'Inter', sans-serif; }
-        .navbar { background: #1a1a1a; border-bottom: 2px solid #ffdf00; }
-        .card-stat { background: #1a1a1a; border: none; border-radius: 15px; transition: 0.3s; }
-        .card-stat:hover { transform: translateY(-5px); background: #252525; }
+        body { background: #0a0a0a; color: #f0f0f0; font-family: 'Segoe UI', sans-serif; }
+        .navbar { background: #111; border-bottom: 3px solid #ffdf00; }
+        .card-main { background: #151515; border: 1px solid #333; border-radius: 15px; }
         .text-gold { color: #ffdf00; }
-        .signal-card { background: #1a1a1a; border-radius: 12px; margin-bottom: 15px; border-left: 5px solid #ffdf00; padding: 15px; }
-        .badge-buy { background: #00ff8822; color: #00ff88; border: 1px solid #00ff88; }
-        .badge-sell { background: #ff475722; color: #ff4757; border: 1px solid #ff4757; }
-        .status-ok { color: #00ff88; font-weight: bold; font-size: 0.8em; }
+        .winrate-circle { width: 100px; height: 100px; border-radius: 50%; border: 5px solid #ffdf00; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 1.2em; margin: 0 auto; }
+        .signal-item { background: #1a1a1a; border-radius: 10px; padding: 15px; margin-bottom: 10px; border-left: 4px solid #ffdf00; }
+        .status-badge { font-size: 0.7em; padding: 4px 8px; border-radius: 5px; }
     </style>
 </head>
 <body>
     <nav class="navbar navbar-dark mb-4">
         <div class="container">
-            <span class="navbar-brand mb-0 h1"><i class="fas fa-piggy-bank text-gold"></i> FAT PIG <span class="text-gold">PREMIUM</span></span>
-            <span class="text-muted small">Iniciado em: {{stats.inicio}}</span>
+            <span class="navbar-brand h1"><i class="fas fa-chart-line text-gold"></i> FAT PIG <span class="text-gold">REAL-TIME</span></span>
+            <span class="badge bg-success">SISTEMA ATIVO</span>
         </div>
     </nav>
 
     <div class="container">
         <div class="row g-3 mb-4">
             <div class="col-md-4">
-                <div class="card-stat p-3 text-center">
-                    <div class="text-muted small">TOTAL DE SINAIS</div>
-                    <div class="h2 text-gold">{{stats.total}}</div>
+                <div class="card-main p-4 text-center">
+                    <div class="text-muted small mb-2">SALDO BINANCE FUTURES</div>
+                    <div class="h1 text-gold">${{ "%.2f"|format(stats.saldo_real) }}</div>
+                    <div class="small text-muted">Atualizado agora</div>
                 </div>
             </div>
             <div class="col-md-4">
-                <div class="card-stat p-3 text-center">
-                    <div class="text-muted small">EXECUTADOS BINANCE</div>
-                    <div class="h2 text-success">{{stats.sucesso_binance}}</div>
+                <div class="card-main p-4 text-center">
+                    <div class="text-muted small mb-2">WINRATE ATUAL</div>
+                    <div class="winrate-circle">{{ "%.1f"|format(stats.winrate) }}%</div>
+                    <div class="mt-2 small">{{stats.wins}}W - {{stats.losses}}L</div>
                 </div>
             </div>
             <div class="col-md-4">
-                <div class="card-stat p-3 text-center">
-                    <div class="text-muted small">STATUS DO BOT</div>
-                    <div class="h2 text-info"><i class="fas fa-robot"></i> ATIVO</div>
+                <div class="card-main p-4 text-center">
+                    <div class="text-muted small mb-2">TOTAL DE SINAIS</div>
+                    <div class="h1 text-white">{{stats.total}}</div>
+                    <div class="small text-muted">Desde {{stats.inicio}}</div>
                 </div>
             </div>
         </div>
 
-        <h4 class="mb-3"><i class="fas fa-bolt text-gold"></i> ÚLTIMOS SINAIS</h4>
-        <div class="row">
-            {% for s in sinais|reverse %}
-            <div class="col-md-6">
-                <div class="signal-card">
-                    <div class="d-flex justify-content-between align-items-center">
-                        <h5 class="mb-0">{{s.simbolo}}</h5>
-                        <span class="badge {{ 'badge-buy' if s.direcao == 'COMPRA' else 'badge-sell' }}">{{s.direcao}}</span>
-                    </div>
-                    <div class="mt-2 small">
+        <div class="card-main p-4">
+            <h4 class="mb-4"><i class="fas fa-list text-gold"></i> MONITORAMENTO DE SINAIS</h4>
+            <div class="row">
+                {% for s in sinais|reverse %}
+                <div class="col-md-6">
+                    <div class="signal-item">
                         <div class="d-flex justify-content-between">
-                            <span>Preço: <strong>${{s.preco}}</strong></span>
-                            <span>Hora: {{s.tempo}}</span>
+                            <span class="h5 mb-0">{{s.simbolo}}</span>
+                            <span class="badge {{ 'bg-success' if s.direcao == 'COMPRA' else 'bg-danger' }}">{{s.direcao}}</span>
                         </div>
-                        <div class="mt-1">
+                        <div class="mt-2 d-flex justify-content-between align-items-center">
+                            <span class="small">Preço: <strong>${{s.preco}}</strong></span>
+                            <span class="small text-muted">{{s.tempo}}</span>
+                        </div>
+                        <div class="mt-2">
                             {% if s.executado %}
-                            <span class="status-ok"><i class="fas fa-check-circle"></i> ORDEM ENVIADA PARA BINANCE</span>
+                            <span class="text-success small"><i class="fas fa-check-circle"></i> EXECUTADO NA BINANCE</span>
                             {% else %}
-                            <span class="text-danger small"><i class="fas fa-times-circle"></i> ERRO NA EXECUÇÃO (SALDO?)</span>
+                            <span class="text-warning small"><i class="fas fa-exclamation-triangle"></i> AGUARDANDO MARGEM</span>
                             {% endif %}
                         </div>
                     </div>
                 </div>
+                {% endfor %}
             </div>
-            {% endfor %}
         </div>
     </div>
     <script>setTimeout(() => location.reload(), 30000);</script>
@@ -225,6 +230,7 @@ DASHBOARD_HTML = '''
 
 @app.route('/')
 def index():
+    bot_data.atualizar_saldo()
     return render_template_string(DASHBOARD_HTML, sinais=list(bot_data.sinais), stats=bot_data.stats)
 
 if __name__ == '__main__':
