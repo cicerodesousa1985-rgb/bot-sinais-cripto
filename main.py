@@ -1,4 +1,3 @@
-
 import os
 import time
 import threading
@@ -211,6 +210,85 @@ def buscar_preco_real(simbolo):
     return valores.get(simbolo, 100.0)
 
 # =========================
+# MONITORAMENTO REAL (ATUALIZADO!)
+# =========================
+
+def monitorar_operacao_real(sinal):
+    """Monitora o preço real para abrir e fechar a operação baseada nos alvos"""
+    sinal_id = sinal["id"]
+    simbolo = sinal["simbolo"]
+    direcao = sinal["direcao"]
+    entrada = sinal["entrada"]
+    alvos = sinal["alvos"]
+    stop_loss = sinal["stop_loss"]
+    
+    posicao_aberta = False
+    preco_entrada_real = 0.0
+    
+    logger.info(f"🔍 Iniciando monitoramento real para {sinal_id} ({simbolo})")
+    
+    # Timeout de segurança: 24 horas
+    timeout_seconds = 24 * 3600
+    start_time = time.time()
+    
+    while (time.time() - start_time) < timeout_seconds:
+        try:
+            preco_atual = buscar_preco_real(simbolo)
+            
+            if not posicao_aberta:
+                # Lógica para abrir posição (preço atingiu entrada)
+                if direcao == "COMPRA":
+                    if preco_atual <= entrada:
+                        posicao_aberta = True
+                        preco_entrada_real = preco_atual
+                        logger.info(f"✅ [ENTRADA] {simbolo} atingiu entrada de COMPRA em ${preco_atual}")
+                else: # VENDA
+                    if preco_atual >= entrada:
+                        posicao_aberta = True
+                        preco_entrada_real = preco_atual
+                        logger.info(f"✅ [ENTRADA] {simbolo} atingiu entrada de VENDA em ${preco_atual}")
+            
+            if posicao_aberta:
+                # Lógica para fechar posição (alvos ou stop)
+                if direcao == "COMPRA":
+                    # Verificar Take Profit (usando TP1 como referência principal)
+                    if preco_atual >= alvos[0]:
+                        profit = ((preco_atual / preco_entrada_real) - 1) * 100
+                        sistema_winrate.atualizar_resultado(sinal_id, "WIN", profit)
+                        logger.info(f"🎯 [WIN] {simbolo} atingiu TP1 em ${preco_atual} (Profit: {profit:.2f}%)")
+                        break
+                    # Verificar Stop Loss
+                    elif preco_atual <= stop_loss:
+                        profit = ((preco_atual / preco_entrada_real) - 1) * 100
+                        sistema_winrate.atualizar_resultado(sinal_id, "LOSS", profit)
+                        logger.info(f"🛑 [LOSS] {simbolo} atingiu STOP em ${preco_atual} (Loss: {profit:.2f}%)")
+                        break
+                else: # VENDA
+                    # Verificar Take Profit
+                    if preco_atual <= alvos[0]:
+                        profit = ((preco_entrada_real / preco_atual) - 1) * 100
+                        sistema_winrate.atualizar_resultado(sinal_id, "WIN", profit)
+                        logger.info(f"🎯 [WIN] {simbolo} atingiu TP1 em ${preco_atual} (Profit: {profit:.2f}%)")
+                        break
+                    # Verificar Stop Loss
+                    elif preco_atual >= stop_loss:
+                        profit = -((preco_atual / preco_entrada_real) - 1) * 100
+                        sistema_winrate.atualizar_resultado(sinal_id, "LOSS", profit)
+                        logger.info(f"🛑 [LOSS] {simbolo} atingiu STOP em ${preco_atual} (Loss: {profit:.2f}%)")
+                        break
+            
+            # Esperar 30 segundos antes da próxima verificação para não sobrecarregar APIs
+            time.sleep(30)
+            
+        except Exception as e:
+            logger.error(f"Erro no monitoramento de {simbolo}: {e}")
+            time.sleep(60)
+            
+    # Se sair do loop por timeout
+    if (time.time() - start_time) >= timeout_seconds:
+        logger.info(f"⏰ Timeout de monitoramento para {sinal_id}")
+
+# =========================
 # GERADOR DE SINAIS
 # =========================
 
@@ -296,24 +374,8 @@ def gerar_sinal(simbolo):
     # Adicionar ao sistema de winrate (inicialmente sem resultado)
     sinal_completo = sistema_winrate.adicionar_sinal(sinal)
     
-    # Simular resultado após algum tempo (70% de winrate)
-    def simular_resultado(sinal_id):
-        time.sleep(random.randint(300, 1800))  # 5-30 minutos depois
-        
-        # 70% chance de WIN, 30% de LOSS
-        resultado = "WIN" if random.random() < 0.7 else "LOSS"
-        
-        # Calcular profit (2-8% para WIN, 1-4% para LOSS)
-        if resultado == "WIN":
-            profit = random.uniform(2.0, 8.0)
-        else:
-            profit = random.uniform(-4.0, -1.0)
-        
-        sistema_winrate.atualizar_resultado(sinal_id, resultado, profit)
-        logger.info(f"📊 Sinal {sinal_id}: {resultado} ({profit:+.1f}%)")
-    
-    # Iniciar simulação em thread separada
-    threading.Thread(target=simular_resultado, args=(sinal_completo["id"],), daemon=True).start()
+    # Iniciar monitoramento real em thread separada
+    threading.Thread(target=monitorar_operacao_real, args=(sinal_completo,), daemon=True).start()
     
     return sinal_completo
 
@@ -858,7 +920,7 @@ DASHBOARD_TEMPLATE = '''
                 <i class="fas fa-info-circle"></i> Sistema de Winrate v1.0 • Dados em tempo real
             </p>
             <p style="font-size: 0.8em; margin-top: 10px; color: #444;">
-                ⚠️ Os resultados são simulados para demonstração do sistema
+                ⚠️ Os resultados são baseados em monitoramento de preços reais
             </p>
         </div>
     </div>
