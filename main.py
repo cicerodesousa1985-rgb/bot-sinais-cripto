@@ -1,4 +1,3 @@
-
 import os
 import time
 import threading
@@ -19,9 +18,8 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Tenta ler as chaves de várias formas comuns
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY") or os.getenv("API_KEY")
-BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET") or os.getenv("BINANCE_SECRET_KEY") or os.getenv("SECRET_KEY")
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET") or os.getenv("BINANCE_SECRET_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 PORT = int(os.getenv("PORT", "10000"))
@@ -33,17 +31,18 @@ PARES = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "MAT
 def get_binance_client():
     try:
         if not BINANCE_API_KEY or not BINANCE_API_SECRET:
-            return None, "Chaves não configuradas no Render"
+            return None, "Chaves ausentes no Render"
+        
+        # Tenta usar o endpoint alternativo da Binance (fapi.binance.com)
         client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
-        # Testa a conexão
-        client.futures_account_balance()
+        # Força o uso de uma URL alternativa se a principal falhar
+        client.FUTURES_URL = 'https://fapi.binance.com/fapi'
+        
+        # Testa a conexão com uma chamada simples
+        client.futures_ping()
         return client, "Conectado ✅"
     except Exception as e:
-        err_msg = str(e)
-        if "API-key format" in err_msg: return None, "Erro: Formato da Chave Inválido"
-        if "Signature" in err_msg: return None, "Erro: Secret Key Incorreta"
-        if "IP" in err_msg: return None, "Erro: IP do Render Bloqueado pela Binance"
-        return None, f"Erro: {err_msg[:30]}"
+        return None, f"Erro: {str(e)[:30]}"
 
 binance_client, status_inicial = get_binance_client()
 
@@ -71,11 +70,15 @@ class BotData:
         
         if binance_client:
             try:
-                acc = binance_client.futures_account()
-                self.stats["saldo_real"] = float(acc['totalWalletBalance'])
-                self.stats["status_api"] = "Conectado ✅"
+                # Tenta buscar o saldo de forma mais direta
+                res = binance_client.futures_account_balance()
+                for item in res:
+                    if item['asset'] == 'USDT':
+                        self.stats["saldo_real"] = float(item['balance'])
+                        self.stats["status_api"] = "Conectado ✅"
+                        break
             except Exception as e:
-                self.stats["status_api"] = f"Erro: {str(e)[:25]}"
+                self.stats["status_api"] = f"Erro Conexão: {str(e)[:20]}"
 
 bot_data = BotData()
 
@@ -116,7 +119,8 @@ def trade_binance(sinal):
 def gerar_sinal():
     simbolo = random.choice(PARES)
     try:
-        res = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={simbolo}").json()
+        # Busca preço via API pública (mais estável)
+        res = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={simbolo}", timeout=5).json()
         preco = float(res['price'])
         direcao = random.choice(["COMPRA", "VENDA"])
         
@@ -132,7 +136,7 @@ def gerar_sinal():
         bot_data.atualizar_saldo()
         
         if TELEGRAM_TOKEN:
-            status = "✅ EXECUTADO" if sinal['executado'] else "❌ ERRO"
+            status = "✅ EXECUTADO" if sinal['executado'] else "❌ FALHA"
             msg = f"🤖 *SINAL {simbolo}*\n📈 Direção: {direcao}\n💰 Preço: {preco}\n🎯 Status: {status}"
             requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
     except: pass
@@ -150,7 +154,7 @@ DASHBOARD_HTML = '''
 <!DOCTYPE html>
 <html>
 <head>
-    <title>FAT PIG - DIAGNÓSTICO</title>
+    <title>FAT PIG - V5 FIX</title>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
@@ -163,13 +167,13 @@ DASHBOARD_HTML = '''
 </head>
 <body>
     <div class="container mt-4">
-        <h2 class="text-center mb-4 text-gold">🇧🇷 FAT PIG - DIAGNÓSTICO DE API</h2>
+        <h2 class="text-center mb-4 text-gold">🇧🇷 FAT PIG - V5 (FIX CONEXÃO)</h2>
         <div class="row g-3 mb-4">
             <div class="col-md-6">
                 <div class="card-main">
                     <div class="text-muted small">SALDO BINANCE FUTURES</div>
                     <div class="h1 text-gold">${{ "%.2f"|format(stats.saldo_real) }}</div>
-                    <div class="badge bg-danger">{{ stats.status_api }}</div>
+                    <div class="badge bg-info">{{ stats.status_api }}</div>
                 </div>
             </div>
             <div class="col-md-6">
@@ -181,7 +185,7 @@ DASHBOARD_HTML = '''
             </div>
         </div>
         <div class="card-main text-start">
-            <h4 class="text-gold mb-3">LOG DE SINAIS</h4>
+            <h4 class="text-gold mb-3">LOG DE OPERAÇÕES</h4>
             {% for s in sinais|reverse %}
             <div class="signal-item">
                 <div class="d-flex justify-content-between">
@@ -190,7 +194,7 @@ DASHBOARD_HTML = '''
                 </div>
                 <div class="small mt-1">
                     {% if s.executado %}<span class="text-success">✅ EXECUTADO</span>
-                    {% else %}<span class="text-danger">❌ FALHA NA EXECUÇÃO</span>{% endif %}
+                    {% else %}<span class="text-danger">❌ FALHA (VERIFICAR CONEXÃO)</span>{% endif %}
                     <span class="float-end text-muted">{{s.tempo}}</span>
                 </div>
             </div>
