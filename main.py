@@ -17,36 +17,24 @@ from binance.enums import *
 # =========================
 app = Flask(__name__)
 
-# Configurar logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Configurações de Ambiente
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
-BOT_INTERVAL = int(os.getenv("BOT_INTERVAL", "300"))
+BOT_INTERVAL = 60  # Reduzido para 1 minuto para mais sinais
 PORT = int(os.getenv("PORT", "10000"))
 
-# Configurações de Trade
 LEVERAGE = 10
 MARGIN_TYPE = "ISOLATED"
-USDT_MARGIN_PER_TRADE = 6.0 
 
-# Inicializar Cliente Binance
 try:
-    if BINANCE_API_KEY and BINANCE_API_SECRET:
-        binance_client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
-        logger.info("✅ Conectado à Binance com sucesso")
-    else:
-        logger.warning("⚠️ Chaves da Binance não encontradas.")
-        binance_client = None
+    binance_client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+    logger.info("✅ Conectado à Binance")
 except Exception as e:
-    logger.error(f"❌ Erro ao conectar na Binance: {e}")
+    logger.error(f"❌ Erro Binance: {e}")
     binance_client = None
 
 # =========================
@@ -55,31 +43,14 @@ except Exception as e:
 class SistemaWinrate:
     def __init__(self):
         self.sinais = deque(maxlen=100)
-        self.estatisticas = {
-            "total_sinais": 0,
-            "sinais_vencedores": 0,
-            "sinais_perdedores": 0,
-            "winrate": 0.0,
-            "profit_total": 0.0,
-            "melhor_sequencia": 0,
-            "pior_sequencia": 0,
-            "sinais_hoje": 0,
-            "winrate_hoje": 0.0,
-            "ultima_atualizacao": None
-        }
+        self.estatisticas = {"total_sinais": 0, "sinais_vencedores": 0, "sinais_perdedores": 0, "winrate": 0.0, "profit_total": 0.0, "ultima_atualizacao": None}
     
-    def adicionar_sinal(self, sinal, resultado=None):
-        sinal_completo = {
-            **sinal,
-            "resultado": resultado,
-            "timestamp_fechamento": None,
-            "profit": 0.0,
-            "executado_binance": False
-        }
-        self.sinais.append(sinal_completo)
+    def adicionar_sinal(self, sinal):
+        sinal['executado_binance'] = False
+        self.sinais.append(sinal)
         self.estatisticas["total_sinais"] += 1
-        self.calcular_estatisticas()
-        return sinal_completo
+        self.estatisticas["ultima_atualizacao"] = datetime.now().strftime("%H:%M:%S")
+        return sinal
 
     def atualizar_execucao(self, sinal_id, status):
         for s in self.sinais:
@@ -87,183 +58,141 @@ class SistemaWinrate:
                 s['executado_binance'] = status
                 break
 
-    def calcular_estatisticas(self):
-        total = self.estatisticas["sinais_vencedores"] + self.estatisticas["sinais_perdedores"]
-        if total > 0:
-            self.estatisticas["winrate"] = (self.estatisticas["sinais_vencedores"] / total) * 100
-        self.estatisticas["ultima_atualizacao"] = datetime.now().strftime("%H:%M:%S")
-
     def get_estatisticas(self):
-        return {
-            **self.estatisticas,
-            "winrate_formatado": f"{self.estatisticas['winrate']:.1f}%",
-            "winrate_hoje_formatado": f"{self.estatisticas['winrate_hoje']:.1f}%",
-            "profit_total_formatado": f"${self.estatisticas['profit_total']:+.2f}",
-            "total_fechados": self.estatisticas["sinais_vencedores"] + self.estatisticas["sinais_perdedores"],
-            "sinais_em_aberto": self.estatisticas["total_sinais"] - (self.estatisticas["sinais_vencedores"] + self.estatisticas["sinais_perdedores"])
-        }
-
-    def get_historico(self, limite=20):
-        return list(self.sinais)[-limite:]
+        total = self.estatisticas["sinais_vencedores"] + self.estatisticas["sinais_perdedores"]
+        winrate = (self.estatisticas["sinais_vencedores"] / total * 100) if total > 0 else 0
+        return {**self.estatisticas, "winrate_formatado": f"{winrate:.1f}%"}
 
 sistema_winrate = SistemaWinrate()
 
 # =========================
-# EXECUÇÃO DE ORDENS BINANCE
+# EXECUÇÃO DINÂMICA BINANCE
 # =========================
-def configurar_alavancagem(simbolo):
-    try:
-        binance_client.futures_change_margin_type(symbol=simbolo, marginType=MARGIN_TYPE)
-    except: pass
-    try:
-        binance_client.futures_change_leverage(symbol=simbolo, leverage=LEVERAGE)
-    except: pass
-
 def executar_trade_binance(sinal):
     if not binance_client: return False
     simbolo = sinal['simbolo']
     try:
-        configurar_alavancagem(simbolo)
+        # 1. Configurar Margem e Alavancagem
+        try: binance_client.futures_change_margin_type(symbol=simbolo, marginType=MARGIN_TYPE)
+        except: pass
+        binance_client.futures_change_leverage(symbol=simbolo, leverage=LEVERAGE)
+
+        # 2. Buscar Lote Mínimo e Precisão
         info = binance_client.futures_exchange_info()
-        symbol_info = next(item for item in info['symbols'] if item['symbol'] == simbolo)
-        qty_precision = symbol_info['quantityPrecision']
-        price_precision = symbol_info['pricePrecision']
-
-        valor_nominal = USDT_MARGIN_PER_TRADE * LEVERAGE
-        quantidade = round(valor_nominal / sinal['preco_atual'], qty_precision)
+        s_info = next(i for i in info['symbols'] if i['symbol'] == simbolo)
         
-        tp1 = round(sinal['alvos'][0], price_precision)
-        sl = round(sinal['stop_loss'], price_precision)
+        # Filtro de quantidade mínima (LOT_SIZE)
+        lot_filter = next(f for f in s_info['filters'] if f['filterType'] == 'LOT_SIZE')
+        min_qty = float(lot_filter['minQty'])
+        qty_precision = s_info['quantityPrecision']
+        
+        # Filtro de valor nominal mínimo (MIN_NOTIONAL)
+        min_notional = 5.1 # Padrão Binance Futures é 5 USDT, usamos 5.1 para garantir
+        for f in s_info['filters']:
+            if f['filterType'] == 'MIN_NOTIONAL':
+                min_notional = float(f['notional']) if 'notional' in f else 5.1
 
+        # 3. Calcular Quantidade Mínima Real
+        # Quantidade = Valor Nominal / Preço
+        quantidade = max(min_qty, round(min_notional / sinal['preco_atual'], qty_precision))
+        
+        # Garantir que a quantidade respeite o stepSize
+        step_size = float(lot_filter['stepSize'])
+        quantidade = round(quantidade // step_size * step_size, qty_precision)
+
+        # 4. Executar Ordens
         side = SIDE_BUY if sinal['direcao'] == "COMPRA" else SIDE_SELL
         side_contrario = SIDE_SELL if sinal['direcao'] == "COMPRA" else SIDE_BUY
         
+        # Entrada a Mercado
         binance_client.futures_create_order(symbol=simbolo, side=side, type=FUTURE_ORDER_TYPE_MARKET, quantity=quantidade)
-        binance_client.futures_create_order(symbol=simbolo, side=side_contrario, type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET, stopPrice=tp1, closePosition=True)
+        
+        # TP e SL (Encerramento de Posição)
+        price_precision = s_info['pricePrecision']
+        tp = round(sinal['alvos'][0], price_precision)
+        sl = round(sinal['stop_loss'], price_precision)
+
+        binance_client.futures_create_order(symbol=simbolo, side=side_contrario, type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET, stopPrice=tp, closePosition=True)
         binance_client.futures_create_order(symbol=simbolo, side=side_contrario, type=FUTURE_ORDER_TYPE_STOP_MARKET, stopPrice=sl, closePosition=True)
         
         sistema_winrate.atualizar_execucao(sinal['id'], True)
         return True
     except Exception as e:
-        logger.error(f"Erro Binance: {e}")
+        logger.error(f"Erro na execução de {simbolo}: {e}")
         return False
 
 # =========================
-# DASHBOARD TEMPLATE (ORIGINAL)
+# LÓGICA DE SINAIS (AGRESSIVA)
 # =========================
-DASHBOARD_TEMPLATE = '''
-<!DOCTYPE html>
-<html lang="pt-br">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FAT PIG SIGNALS - Winrate</title>
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
-    <style>
-        :root {
-            --bg: #0a0a0a;
-            --card: #151515;
-            --amarelo-brasil: #ffdf00;
-            --verde-win: #00ff88;
-            --vermelho-loss: #ff4757;
-            --azul-brasil: #002776;
-        }
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: var(--bg); color: white; margin: 0; padding: 20px; }
-        .container { max-width: 1200px; margin: 0 auto; }
-        .header { text-align: center; padding: 40px 0; border-bottom: 3px solid var(--amarelo-brasil); margin-bottom: 30px; }
-        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 30px; }
-        .stat-card { background: var(--card); padding: 20px; border-radius: 15px; text-align: center; border: 1px solid rgba(255,255,255,0.1); }
-        .stat-value { font-size: 1.8em; font-weight: bold; color: var(--amarelo-brasil); }
-        .sinais-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
-        .card-sinal { background: var(--card); padding: 20px; border-radius: 15px; border-left: 5px solid var(--amarelo-brasil); position: relative; }
-        .badge-exec { position: absolute; top: 10px; right: 10px; font-size: 0.7em; padding: 5px 10px; border-radius: 10px; background: var(--azul-brasil); }
-        .compra { border-left-color: var(--verde-win); }
-        .venda { border-left-color: var(--vermelho-loss); }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>🇧🇷 FAT PIG SIGNALS - BINANCE AUTO-TRADE</h1>
-            <p>Monitoramento em Tempo Real e Execução Automática</p>
-        </div>
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-value">{{ stats.winrate_formatado }}</div>
-                <div class="stat-label">WINRATE</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value">{{ stats.total_sinais }}</div>
-                <div class="stat-label">TOTAL SINAIS</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value">{{ stats.profit_total_formatado }}</div>
-                <div class="stat-label">PROFIT TOTAL</div>
-            </div>
-        </div>
-        <h2>Últimos Sinais</h2>
-        <div class="sinais-grid">
-            {% for sinal in sinais %}
-            <div class="card-sinal {{ sinal.direcao.lower() }}">
-                {% if sinal.executado_binance %}
-                <div class="badge-exec">✅ BINANCE</div>
-                {% endif %}
-                <h3>{{ sinal.simbolo }} - {{ sinal.direcao }}</h3>
-                <p>Preço: ${{ sinal.preco_atual }}</p>
-                <p>TP1: {{ sinal.alvos[0] }} | SL: {{ sinal.stop_loss }}</p>
-                <small>{{ sinal.timestamp }}</small>
-            </div>
-            {% endfor %}
-        </div>
-    </div>
-</body>
-</html>
-'''
-
-# =========================
-# ROTAS E LOGICA
-# =========================
-@app.route('/')
-def dashboard():
-    return render_template_string(
-        DASHBOARD_TEMPLATE,
-        sinais=sistema_winrate.get_historico(10)[::-1],
-        stats=sistema_winrate.get_estatisticas()
-    )
-
-def buscar_preco_real(simbolo):
-    try:
-        res = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={simbolo}", timeout=5).json()
-        return float(res['price'])
-    except: return 0.0
-
-def enviar_telegram(sinal, exec_status):
-    if not TELEGRAM_TOKEN: return
-    status = "✅ EXECUTADO NA BINANCE" if exec_status else "⚠️ SINAL GERADO (SEM EXECUÇÃO)"
-    msg = f"📢 *{sinal['simbolo']} - {sinal['direcao']}*\nPreço: {sinal['preco_atual']}\nTP1: {sinal['alvos'][0]}\nSL: {sinal['stop_loss']}\n\n🤖 {status}"
-    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+PARES = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "MATICUSDT", "LINKUSDT", "AVAXUSDT", "DOTUSDT", "LTCUSDT", "BCHUSDT", "SHIBUSDT", "TRXUSDT", "NEARUSDT"]
 
 def gerar_sinal(simbolo):
-    preco = buscar_preco_real(simbolo)
-    if preco == 0: return
-    direcao = random.choice(["COMPRA", "VENDA"])
-    sinal = {
-        "id": f"{simbolo}{int(time.time())}", "simbolo": simbolo, "direcao": direcao,
-        "preco_atual": preco, "entrada": preco, "alvos": [round(preco*1.01, 4) if direcao=="COMPRA" else round(preco*0.99, 4)],
-        "stop_loss": round(preco*0.99, 4) if direcao=="COMPRA" else round(preco*1.01, 4),
-        "timestamp": datetime.now().strftime("%H:%M:%S")
-    }
-    sistema_winrate.adicionar_sinal(sinal)
-    sucesso = executar_trade_binance(sinal)
-    enviar_telegram(sinal, sucesso)
+    try:
+        res = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={simbolo}", timeout=5).json()
+        preco = float(res['price'])
+        
+        # Estratégia Agressiva: Simula análise técnica rápida
+        # Em um bot real, aqui entraria sua lógica de RSI/MACD
+        direcao = random.choice(["COMPRA", "VENDA"])
+        
+        sinal = {
+            "id": f"{simbolo}{int(time.time())}",
+            "simbolo": simbolo,
+            "direcao": direcao,
+            "preco_atual": preco,
+            "entrada": preco,
+            "alvos": [round(preco*1.005, 4) if direcao=="COMPRA" else round(preco*0.995, 4)], # TP Curto para banca pequena
+            "stop_loss": round(preco*0.99, 4) if direcao=="COMPRA" else round(preco*1.01, 4),
+            "timestamp": datetime.now().strftime("%H:%M:%S")
+        }
+        
+        sistema_winrate.adicionar_sinal(sinal)
+        sucesso = executar_trade_binance(sinal)
+        
+        if TELEGRAM_TOKEN:
+            status = "✅ EXECUTADO" if sucesso else "❌ SALDO/ERRO"
+            msg = f"🚀 *{simbolo} - {direcao}*\n💰 Preço: {preco}\n🎯 TP1: {sinal['alvos'][0]}\n🛑 SL: {sinal['stop_loss']}\n🤖 Status: {status}"
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+    except: pass
 
 def worker():
-    simbolos = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+    logger.info("🤖 Bot Agressivo Iniciado")
     while True:
-        for s in simbolos:
-            if random.random() < 0.1: gerar_sinal(s)
-            time.sleep(2)
+        # Tenta gerar sinais para 3 pares aleatórios da lista a cada ciclo
+        selecionados = random.sample(PARES, 3)
+        for s in selecionados:
+            gerar_sinal(s)
+            time.sleep(5)
         time.sleep(BOT_INTERVAL)
+
+# =========================
+# DASHBOARD
+# =========================
+@app.route('/')
+def index():
+    sinais = list(sistema_winrate.sinais)[::-1]
+    stats = sistema_winrate.get_estatisticas()
+    return render_template_string('''
+    <html><head><title>FAT PIG AGRESSIVO</title>
+    <style>
+        body { background: #0a0a0a; color: white; font-family: sans-serif; text-align: center; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; padding: 20px; }
+        .card { background: #151515; padding: 15px; border-radius: 10px; border-left: 5px solid #ffdf00; }
+        .exec { color: #00ff88; font-weight: bold; }
+    </style></head><body>
+    <h1>🇧🇷 FAT PIG - MODO AGRESSIVO</h1>
+    <p>Winrate: {{stats.winrate_formatado}} | Sinais: {{stats.total_sinais}}</p>
+    <div class="grid">
+        {% for s in sinais %}
+        <div class="card">
+            <h3>{{s.simbolo}} - {{s.direcao}}</h3>
+            <p>Preço: {{s.preco_atual}}</p>
+            {% if s.executado_binance %}<p class="exec">✅ EXECUTADO NA BINANCE</p>{% endif %}
+            <small>{{s.timestamp}}</small>
+        </div>
+        {% endfor %}
+    </div>
+    </body></html>''', sinais=sinais, stats=stats)
 
 if __name__ == '__main__':
     threading.Thread(target=worker, daemon=True).start()
