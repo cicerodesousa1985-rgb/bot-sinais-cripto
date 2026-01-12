@@ -1,175 +1,155 @@
-import os, time, threading, uuid, requests
-from flask import Flask, jsonify, render_template_string
+import os, time, threading, uuid, requests, math
+from flask import Flask, jsonify, request, render_template_string
 from collections import deque
 from threading import Lock
 from datetime import datetime
 
-# ================= CONFIG =================
-PORT = int(os.getenv("PORT", 10000))
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+PORT = 10000
 
-SYMBOLS = ["BTCUSDT", "ETHUSDT"]
-PRICE_MAP = {
-    "BTCUSDT": "bitcoin",
-    "ETHUSDT": "ethereum"
+# ================= USERS / SUBSCRIPTIONS =================
+USERS = {
+    "demo": {"plan": "FREE", "limit": 3},
+    "pro123": {"plan": "PRO", "limit": 999}
 }
 
-# ================= PRICE =================
-def get_price(symbol):
-    coin = PRICE_MAP[symbol]
-    r = requests.get(
-        f"https://api.coingecko.com/api/v3/simple/price?ids={coin}&vs_currencies=usd",
-        timeout=10
-    ).json()
-    return r[coin]["usd"]
+# ================= PRICE & CANDLES =================
+def get_candles(symbol, limit=100):
+    fsym = symbol.replace("USDT","")
+    url = f"https://min-api.cryptocompare.com/data/v2/histominute?fsym={fsym}&tsym=USD&limit={limit}"
+    return requests.get(url, timeout=10).json()["Data"]["Data"]
 
-# ================= WINRATE =================
-class Winrate:
+def get_price(symbol):
+    return get_candles(symbol, 1)[-1]["close"]
+
+# ================= INDICATORS =================
+def ema(values, period):
+    k = 2/(period+1)
+    ema_val = values[0]
+    for v in values:
+        ema_val = v*k + ema_val*(1-k)
+    return ema_val
+
+def rsi(values, period=14):
+    gains, losses = 0,0
+    for i in range(1,period+1):
+        diff = values[-i] - values[-i-1]
+        if diff > 0: gains += diff
+        else: losses -= diff
+    if losses == 0: return 100
+    rs = gains / losses
+    return 100 - (100/(1+rs))
+
+# ================= AI FILTER =================
+def ai_score(prices):
+    r = rsi(prices)
+    e9 = ema(prices,9)
+    e21 = ema(prices,21)
+    score = 0
+    if r < 30: score += 1
+    if e9 > e21: score += 1
+    return score >= 2  # only good signals pass
+
+# ================= WINRATE SYSTEM =================
+class Engine:
     def __init__(self):
         self.lock = Lock()
-        self.signals = deque(maxlen=2000)
-        self.equity = [0.0]
-
-    def add(self, s):
-        with self.lock:
-            self.signals.append(s)
-
-    def close(self, sid, result, profit):
-        with self.lock:
-            for s in self.signals:
-                if s["id"] == sid and s["resultado"] is None:
-                    s["resultado"] = result
-                    s["profit"] = profit
-                    self.equity.append(self.equity[-1] + profit)
-                    break
-
-    def stats(self):
-        with self.lock:
-            closed = [s for s in self.signals if s["resultado"]]
-            wins = [s for s in closed if s["resultado"] == "WIN"]
-            losses = [s for s in closed if s["resultado"] == "LOSS"]
-
-            winrate = round(len(wins)/len(closed)*100,1) if closed else 0
-            avg_win = sum(s["profit"] for s in wins)/len(wins) if wins else 0
-            avg_loss = abs(sum(s["profit"] for s in losses)/len(losses)) if losses else 0
-            expectancy = round((winrate/100)*avg_win - (1-winrate/100)*avg_loss,2)
-
-            peak = self.equity[0]
-            dd = 0
-            for e in self.equity:
-                peak = max(peak, e)
-                dd = max(dd, peak - e)
-
-            return {
-                "winrate": winrate,
-                "wins": len(wins),
-                "losses": len(losses),
-                "equity": round(self.equity[-1],2),
-                "drawdown": round(dd,2),
-                "expectancy": expectancy,
-                "equity_curve": self.equity
+        self.data = {}
+    def init_user(self, key):
+        if key not in self.data:
+            self.data[key] = {
+                "signals": [],
+                "equity":[0]
             }
+    def add_signal(self, key, s):
+        with self.lock:
+            self.data[key]["signals"].append(s)
+    def close(self, key, sid, res, profit):
+        with self.lock:
+            for s in self.data[key]["signals"]:
+                if s["id"]==sid and s["res"] is None:
+                    s["res"]=res
+                    s["profit"]=profit
+                    self.data[key]["equity"].append(self.data[key]["equity"][-1]+profit)
+    def stats(self, key):
+        sigs = self.data[key]["signals"]
+        closed = [s for s in sigs if s["res"]]
+        wins = [s for s in closed if s["res"]=="WIN"]
+        losses = [s for s in closed if s["res"]=="LOSS"]
+        wr = round(len(wins)/len(closed)*100,1) if closed else 0
+        return {
+            "winrate": wr,
+            "wins":len(wins),
+            "losses":len(losses),
+            "equity": round(self.data[key]["equity"][-1],2),
+            "curve": self.data[key]["equity"]
+        }
 
-WR = Winrate()
+ENGINE = Engine()
+SYMBOLS = ["BTCUSDT","ETHUSDT"]
 
 # ================= SIGNAL =================
-def generate_signal(symbol):
-    price = get_price(symbol)
-    signal = {
-        "id": str(uuid.uuid4()),
-        "symbol": symbol,
-        "entry": price,
-        "stop": price * 0.98,
-        "targets": [price * 1.02, price * 1.04],
-        "resultado": None,
-        "profit": 0
+def generate_signal(user, symbol):
+    candles = get_candles(symbol)
+    prices = [c["close"] for c in candles]
+    if not ai_score(prices): return
+
+    price = prices[-1]
+    s = {
+        "id":str(uuid.uuid4()),
+        "symbol":symbol,
+        "entry":price,
+        "stop":price*0.98,
+        "tp":price*1.02,
+        "res":None,
+        "profit":0
     }
-    WR.add(signal)
-    if TELEGRAM_TOKEN:
-        telegram(f"🚀 NOVO SINAL {symbol}\nEntrada: {price:.2f}")
-    threading.Thread(target=monitor_signal, args=(signal,), daemon=True).start()
+    ENGINE.add_signal(user,s)
+    threading.Thread(target=monitor,args=(user,s),daemon=True).start()
 
-def monitor_signal(s):
-    while s["resultado"] is None:
-        price = get_price(s["symbol"])
-        if price <= s["stop"]:
-            WR.close(s["id"], "LOSS", -1)
-            notify_close(s)
+def monitor(user,s):
+    while s["res"] is None:
+        p = get_price(s["symbol"])
+        if p <= s["stop"]:
+            ENGINE.close(user,s["id"],"LOSS",-1)
             return
-        for t in s["targets"]:
-            if price >= t:
-                profit = (t/s["entry"]-1)*100
-                WR.close(s["id"], "WIN", round(profit,2))
-                notify_close(s)
-                return
-        time.sleep(20)
-
-# ================= TELEGRAM =================
-def telegram(msg):
-    requests.post(
-        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-        json={"chat_id": CHAT_ID, "text": msg}
-    )
-
-def notify_close(s):
-    st = WR.stats()
-    if TELEGRAM_TOKEN:
-        telegram(
-            f"✅ FECHADO {s['symbol']} {s['resultado']}\n"
-            f"Profit: {s['profit']}%\n"
-            f"Winrate: {st['winrate']}%\n"
-            f"Equity: {st['equity']}"
-        )
+        if p >= s["tp"]:
+            ENGINE.close(user,s["id"],"WIN",(p/s["entry"]-1)*100)
+            return
+        time.sleep(30)
 
 # ================= WORKER =================
 def worker():
     while True:
-        for sym in SYMBOLS:
-            generate_signal(sym)
-            time.sleep(5)
+        for key in USERS:
+            ENGINE.init_user(key)
+            for sym in SYMBOLS:
+                if USERS[key]["limit"]>0:
+                    generate_signal(key,sym)
         time.sleep(300)
 
-threading.Thread(target=worker, daemon=True).start()
+threading.Thread(target=worker,daemon=True).start()
 
 # ================= DASHBOARD =================
 HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-<title>FatPig Pro</title>
+<!doctype html><html><head>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-<style>
-body{background:#0b0b0b;color:white;font-family:Arial}
-.card{background:#151515;padding:20px;border-radius:10px;margin:10px}
-.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
-</style>
-</head>
-<body>
-<h1>📊 FATPIG PRO DASHBOARD</h1>
-<div class="grid">
-<div class="card">Winrate<br><b id="w"></b>%</div>
-<div class="card">Equity<br><b id="e"></b></div>
-<div class="card">Drawdown<br><b id="d"></b></div>
-<div class="card">Expectancy<br><b id="x"></b></div>
-</div>
-<canvas id="chart"></canvas>
-
+<style>body{background:#0b0b0b;color:white;font-family:Arial}</style>
+</head><body>
+<h1>FAT PIG PRO</h1>
+<div id="stats"></div>
+<canvas id="c"></canvas>
 <script>
-fetch('/api/stats').then(r=>r.json()).then(d=>{
-document.getElementById('w').innerText=d.winrate
-document.getElementById('e').innerText=d.equity
-document.getElementById('d').innerText=d.drawdown
-document.getElementById('x').innerText=d.expectancy
-new Chart(document.getElementById('chart'),{
+fetch('/api/stats?key={{key}}').then(r=>r.json()).then(d=>{
+document.getElementById('stats').innerHTML=
+'Winrate:'+d.winrate+'% | Equity:'+d.equity
+new Chart(document.getElementById('c'),{
 type:'line',
-data:{labels:d.equity_curve.map((_,i)=>i+1),
-datasets:[{label:'Equity',data:d.equity_curve,borderColor:'#00ff88'}]}
+data:{labels:d.curve.map((_,i)=>i+1),
+datasets:[{data:d.curve,borderColor:'#00ff88'}]}
 })
 })
 </script>
-</body>
-</html>
+</body></html>
 """
 
 # ================= FLASK =================
@@ -177,10 +157,13 @@ app = Flask(__name__)
 
 @app.route("/")
 def dash():
-    return render_template_string(HTML)
+    key = request.args.get("key","demo")
+    return render_template_string(HTML,key=key)
 
 @app.route("/api/stats")
 def stats():
-    return jsonify(WR.stats())
+    key = request.args.get("key","demo")
+    ENGINE.init_user(key)
+    return jsonify(ENGINE.stats(key))
 
-app.run("0.0.0.0", PORT)
+app.run("0.0.0.0",PORT)
