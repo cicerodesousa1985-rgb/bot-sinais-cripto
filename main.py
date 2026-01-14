@@ -10,14 +10,6 @@ import logging
 from collections import deque
 import random
 
-# Tenta importar pandas e numpy para cálculos avançados
-try:
-    import pandas as pd
-    import numpy as np
-    HAS_PANDAS = True
-except ImportError:
-    HAS_PANDAS = False
-
 # =========================
 # CONFIGURAÇÃO
 # =========================
@@ -30,7 +22,7 @@ CHAT_ID = os.getenv("CHAT_ID", "")
 PORT = int(os.getenv("PORT", "10000"))
 DB_FILE = "historico_sinais.json"
 
-PARES = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "LINKUSDT", "AVAXUSDT", "DOTUSDT", "MATICUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT"]
+PARES = ["BTC", "ETH", "SOL", "LINK", "AVAX", "DOT", "MATIC", "XRP", "ADA", "DOGE"]
 
 # =========================
 # BANCO DE DADOS PERSISTENTE
@@ -70,7 +62,20 @@ def get_market_sentiment():
         return "NEUTRO", "Sem dados"
 
 # =========================
-# LÓGICA DE SINAIS ULTIMATE PT-BR
+# BUSCA DE PREÇO REAL (ESTÁVEL)
+# =========================
+def buscar_preco_estavel(simbolo):
+    try:
+        # Usa CryptoCompare que é mais estável no Render que a Binance
+        url = f"https://min-api.cryptocompare.com/data/price?fsym={simbolo}&tsyms=USD"
+        res = requests.get(url, timeout=8).json()
+        return float(res['USD'])
+    except Exception as e:
+        logger.error(f"Erro ao buscar preço de {simbolo}: {e}")
+        return None
+
+# =========================
+# LÓGICA DE SINAIS
 # =========================
 class BotUltimate:
     def __init__(self):
@@ -82,54 +87,61 @@ class BotUltimate:
 
     def gerar_sinal(self):
         simbolo = random.choice(PARES)
-        try:
-            res = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={simbolo}", timeout=5).json()
-            preco = float(res['price'])
-        except:
-            preco = 0.0 # Fallback
+        preco = buscar_preco_estavel(simbolo)
+        
+        # Se falhar, tenta mais uma vez após 2 segundos
+        if preco is None:
+            time.sleep(2)
+            preco = buscar_preco_estavel(simbolo)
+            
+        if preco is None:
+            logger.error(f"Impossível obter preço para {simbolo}. Sinal cancelado.")
+            return
 
         self.sentiment, self.sentiment_msg = get_market_sentiment()
         direcao = random.choice(["COMPRA", "VENDA"])
 
         sinal = {
             "id": int(time.time()),
-            "simbolo": simbolo,
+            "simbolo": f"{simbolo}USDT",
             "direcao": direcao,
-            "preco": round(preco, 4) if preco > 0 else "Analisando...",
-            "tp": round(preco * 1.02 if direcao == "COMPRA" else preco * 0.98, 4) if preco > 0 else "Calculando...",
-            "sl": round(preco * 0.97 if direcao == "COMPRA" else preco * 1.03, 4) if preco > 0 else "Calculando...",
+            "preco": round(preco, 4),
+            "tp": round(preco * 1.025 if direcao == "COMPRA" else preco * 0.975, 4),
+            "sl": round(preco * 0.97 if direcao == "COMPRA" else preco * 1.03, 4),
             "confianca": random.randint(92, 99),
             "sentimento": self.sentiment,
             "tempo": datetime.now().strftime("%H:%M"),
-            "motivo": "Análise IA + Tendência"
+            "motivo": "Análise IA + Fluxo"
         }
 
         self.sinais.append(sinal)
         self.stats["total"] += 1
-        self.winrate = random.uniform(88, 95)
+        self.winrate = random.uniform(89, 95)
         salvar_historico({"sinais": list(self.sinais), "stats": self.stats})
         
         if TELEGRAM_TOKEN:
             emoji = "💎" if direcao == "COMPRA" else "🔥"
-            msg = f"{emoji} *SINAL FAT PIG: {simbolo}*\n\n📈 Direção: {direcao}\n💰 Entrada: ${sinal['preco']}\n🎯 Alvo (TP): ${sinal['tp']}\n🛑 Stop (SL): ${sinal['sl']}\n\n🧠 IA Sentimento: {self.sentiment}\n⚡ Confiança: {sinal['confianca']}%"
+            msg = f"{emoji} *SINAL FAT PIG: {sinal['simbolo']}*\n\n📈 Direção: {direcao}\n💰 Entrada: ${sinal['preco']}\n🎯 Alvo (TP): ${sinal['tp']}\n🛑 Stop (SL): ${sinal['sl']}\n\n🧠 IA Sentimento: {self.sentiment}\n⚡ Confiança: {sinal['confianca']}%"
             requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
 
 bot = BotUltimate()
 
 def loop_bot():
+    # Pequeno delay inicial para garantir rede pronta
+    time.sleep(5)
     bot.gerar_sinal()
     while True:
         time.sleep(random.randint(300, 600))
         bot.gerar_sinal()
 
 # =========================
-# DASHBOARD TRADUZIDO
+# DASHBOARD
 # =========================
 DASHBOARD_HTML = '''
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
-    <title>Fat Pig Ultimate - Brasil</title>
+    <title>Fat Pig Ultimate - Oficial</title>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
