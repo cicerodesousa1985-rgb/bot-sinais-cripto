@@ -5,7 +5,7 @@ schedule==1.2.2
 flask==3.1.2
 python-dotenv==1.0.0
 psutil==5.9.5
-gunicorn==20.1.0
+gunicorn==21.2.0
 ccxt
 numpy
 python-binance
