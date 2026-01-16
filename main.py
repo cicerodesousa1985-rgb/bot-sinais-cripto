@@ -1,219 +1,208 @@
-import threading, time, sqlite3, requests, logging
+import os
+import time
+import threading
+import requests
+import sqlite3
 from datetime import datetime
-from flask import Flask, render_template_string
+from flask import Flask, render_template_string, jsonify
+import logging
+import random
 
-# ======================
-# LOGS
-# ======================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%d/%m %H:%M:%S"
-)
-log = logging.getLogger("FATPIG")
-
-# ======================
+# =========================
 # CONFIG
-# ======================
-app = Flask(__name__)
-DB = "trades.db"
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "LINKUSDT", "AVAXUSDT"]
-TP = 0.02
-SL = 0.03
+# =========================
+PORT = int(os.getenv("PORT", 10000))
+DB_FILE = "trades.db"
 
-# ======================
+PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "LINKUSDT", "AVAXUSDT", "XRPUSDT", "ADAUSDT"]
+SCORE_MIN = 3
+
+# =========================
+# APP
+# =========================
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
+log = logging.getLogger()
+
+# =========================
 # DATABASE
-# ======================
+# =========================
+def db():
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
 def init_db():
-    conn = sqlite3.connect(DB)
-    c = conn.cursor()
+    c = db().cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT,
+            pair TEXT,
             side TEXT,
             entry REAL,
-            exit REAL,
+            tp REAL,
+            sl REAL,
             result TEXT,
-            profit REAL,
-            strategy TEXT,
+            pnl REAL,
             score INTEGER,
-            sentiment TEXT,
-            time TEXT
+            strategies TEXT,
+            open_time TEXT,
+            close_time TEXT
         )
     """)
-    conn.commit()
-    conn.close()
+    db().commit()
 
-def add_trade(row):
-    conn = sqlite3.connect(DB)
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO trades
-        (symbol, side, entry, exit, result, profit, strategy, score, sentiment, time)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, row)
-    conn.commit()
-    conn.close()
+init_db()
 
-def get_trades():
-    conn = sqlite3.connect(DB)
-    c = conn.cursor()
-    c.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 50")
-    rows = c.fetchall()
-    conn.close()
-    return rows
+# =========================
+# MARKET DATA
+# =========================
+def price(pair):
+    coin = pair.replace("USDT", "")
+    r = requests.get(
+        f"https://min-api.cryptocompare.com/data/pricemultifull?fsyms={coin}&tsyms=USDT",
+        timeout=10
+    ).json()
+    data = r["RAW"][coin]["USDT"]
+    return data["PRICE"], data["CHANGEPCT24HOUR"]
 
-# ======================
-# APIs
-# ======================
-def get_price_change(symbol):
-    coin = symbol.replace("USDT", "")
-    url = f"https://min-api.cryptocompare.com/data/pricemultifull?fsyms={coin}&tsyms=USDT"
-    raw = requests.get(url, timeout=10).json()["RAW"][coin]["USDT"]
-    return raw["PRICE"], raw["CHANGEPCT24HOUR"]
-
-def get_sentiment():
+def fear_greed():
     try:
-        s = requests.get("https://api.alternative.me/fng/", timeout=10).json()
-        return s["data"][0]["value_classification"]
+        r = requests.get("https://api.alternative.me/fng/", timeout=10).json()
+        v = int(r["data"][0]["value"])
+        return v
     except:
-        return "Neutral"
+        return 50
 
-# ======================
-# 8 ESTRATÉGIAS
-# ======================
-def strategies(price, change, sentiment):
-    score = 0
-    used = []
+# =========================
+# STRATEGIES (8)
+# =========================
+def strategies(price, change, fg):
+    s = []
+    if change > 2: s.append("Momentum")
+    if change < -2: s.append("Reversão")
+    if fg < 30: s.append("Medo")
+    if fg > 70: s.append("Ganância")
+    if abs(change) > 4: s.append("Volatilidade")
+    if change > 0: s.append("Tendência Alta")
+    if change < 0: s.append("Tendência Baixa")
+    if random.random() > 0.5: s.append("Fluxo")
 
-    # 1 Tendência 24h
-    if change > 3:
-        score -= 1; used.append("Correção 24h")
-    elif change < -3:
-        score += 1; used.append("Repique 24h")
+    return list(set(s))
 
-    # 2 Momentum curto
-    if abs(change) > 1:
-        score += 1 if change > 0 else -1
-        used.append("Momentum")
-
-    # 3 Breakout simples
-    if abs(change) > 4:
-        score += 1 if change > 0 else -1
-        used.append("Breakout")
-
-    # 4 Pullback
-    if 0 < abs(change) < 2:
-        score += 1 if change < 0 else -1
-        used.append("Pullback")
-
-    # 5 Reversão estatística
-    if abs(change) > 6:
-        score -= 1 if change > 0 else +1
-        used.append("Reversão")
-
-    # 6 Sentimento
-    if sentiment in ["Extreme Fear", "Fear"]:
-        score += 1; used.append("Medo")
-    elif sentiment in ["Extreme Greed", "Greed"]:
-        score -= 1; used.append("Ganância")
-
-    # 7 Confirmação MTF (simples)
-    if abs(change) > 2:
-        score += 1 if change > 0 else -1
-        used.append("MTF")
-
-    # 8 Filtro volatilidade
-    if abs(change) < 0.3:
-        used.append("Sem Volatilidade")
-        return None, 0, used
-
-    side = "BUY" if score > 0 else "SELL"
-    return side, score, used
-
-# ======================
-# BOT
-# ======================
+# =========================
+# BOT LOOP
+# =========================
 def bot_loop():
-    log.info("Bot multi-estratégia iniciado")
     while True:
         try:
-            for s in SYMBOLS:
-                price, change = get_price_change(s)
-                sentiment = get_sentiment()
-                side, score, used = strategies(price, change, sentiment)
+            pair = random.choice(PAIRS)
+            p, ch = price(pair)
+            fg = fear_greed()
+            used = strategies(p, ch, fg)
+            score = len(used)
 
-                if not side:
-                    continue
+            log.info(f"{pair} | score {score} | {used}")
 
-                log.info(f"{s} | {side} | Score {score} | {used}")
-
-                time.sleep(30)
-
-                exit_price, _ = get_price_change(s)
-                profit = (exit_price - price) if side == "BUY" else (price - exit_price)
-                result = "WIN" if profit > 0 else "LOSS"
-
-                add_trade((
-                    s, side, round(price,2), round(exit_price,2),
-                    result, round(profit,2),
-                    ", ".join(used), score, sentiment,
-                    datetime.now().strftime("%d/%m %H:%M")
-                ))
-
+            if score < SCORE_MIN:
                 time.sleep(60)
+                continue
+
+            side = "BUY" if ch >= 0 else "SELL"
+            tp = p * (1.02 if side == "BUY" else 0.98)
+            sl = p * (0.97 if side == "BUY" else 1.03)
+
+            # Simula fechamento real por preço
+            time.sleep(random.randint(60, 180))
+            final_price, _ = price(pair)
+
+            win = (final_price >= tp if side == "BUY" else final_price <= tp)
+            result = "WIN" if win else "LOSS"
+            pnl = round((tp - p) if win else (sl - p), 2)
+
+            c = db().cursor()
+            c.execute("""
+                INSERT INTO trades
+                (pair, side, entry, tp, sl, result, pnl, score, strategies, open_time, close_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                pair, side, p, tp, sl, result, pnl, score,
+                ", ".join(used),
+                datetime.now().strftime("%H:%M:%S"),
+                datetime.now().strftime("%H:%M:%S")
+            ))
+            db().commit()
 
         except Exception as e:
             log.error(e)
-            time.sleep(60)
 
-# ======================
+        time.sleep(random.randint(120, 300))
+
+# =========================
 # DASHBOARD
-# ======================
+# =========================
 @app.route("/")
-def dash():
-    t = get_trades()
-    wins = len([x for x in t if x[5]=="WIN"])
-    losses = len([x for x in t if x[5]=="LOSS"])
-    total = wins+losses
-    winrate = round((wins/total)*100,2) if total else 0
-    pnl = round(sum(x[6] for x in t),2)
+def dashboard():
+    c = db().cursor()
+    trades = c.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 50").fetchall()
 
-    html = """
-    <html><head>
-    <title>FAT PIG ULTIMATE</title>
-    <style>
-    body{background:#050505;color:#eee;font-family:Arial;padding:30px}
-    table{width:100%;border-collapse:collapse;margin-top:30px}
-    th,td{border-bottom:1px solid #222;padding:8px;text-align:center}
-    .win{color:#00ff9d}.loss{color:#ff4d4d}
-    </style></head><body>
-    <h1>🐷 FAT PIG ULTIMATE</h1>
-    <p>Winrate: {{w}}% | PnL: {{p}}</p>
+    wins = sum(1 for t in trades if t["result"] == "WIN")
+    losses = sum(1 for t in trades if t["result"] == "LOSS")
+    winrate = round((wins / max(1, wins + losses)) * 100, 2)
+    pnl = round(sum(t["pnl"] for t in trades), 2)
 
-    <table>
-    <tr><th>Par</th><th>Lado</th><th>Resultado</th><th>Lucro</th><th>Score</th><th>Estratégias</th><th>Hora</th></tr>
-    {% for x in t %}
-    <tr>
-    <td>{{x[1]}}</td>
-    <td>{{x[2]}}</td>
-    <td class="{{'win' if x[5]=='WIN' else 'loss'}}">{{x[5]}}</td>
-    <td>{{x[6]}}</td>
-    <td>{{x[8]}}</td>
-    <td>{{x[7]}}</td>
-    <td>{{x[10]}}</td>
-    </tr>
-    {% endfor %}
-    </table>
-    </body></html>
-    """
-    return render_template_string(html, t=t, w=winrate, p=pnl)
+    return render_template_string(TEMPLATE,
+        trades=trades,
+        wins=wins,
+        losses=losses,
+        winrate=winrate,
+        pnl=pnl
+    )
 
-# ======================
+# =========================
+# HTML
+# =========================
+TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+<title>FAT PIG ULTIMATE</title>
+<style>
+body{background:#000;color:#eee;font-family:Arial}
+h1{color:#f5a623}
+table{width:100%;border-collapse:collapse}
+th,td{padding:10px;border-bottom:1px solid #222;text-align:center}
+.win{color:#00ff99}
+.loss{color:#ff4d4d}
+</style>
+</head>
+<body>
+<h1>🐷 FAT PIG ULTIMATE</h1>
+<p>Winrate: {{winrate}}% | PnL: {{pnl}}</p>
+
+<table>
+<tr>
+<th>Par</th><th>Lado</th><th>Resultado</th><th>Lucro</th><th>Score</th><th>Estratégias</th><th>Hora</th>
+</tr>
+{% for t in trades %}
+<tr>
+<td>{{t.pair}}</td>
+<td>{{t.side}}</td>
+<td class="{{'win' if t.result=='WIN' else 'loss'}}">{{t.result}}</td>
+<td>{{t.pnl}}</td>
+<td>{{t.score}}</td>
+<td>{{t.strategies}}</td>
+<td>{{t.close_time}}</td>
+</tr>
+{% endfor %}
+</table>
+</body>
+</html>
+"""
+
+# =========================
 # START
-# ======================
+# =========================
 if __name__ == "__main__":
-    init_db()
     threading.Thread(target=bot_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=10000)
+    app.run(host="0.0.0.0", port=PORT)
