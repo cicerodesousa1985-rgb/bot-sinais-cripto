@@ -1,231 +1,165 @@
-# FAT PIG ULTIMATE – BOT + DASHBOARD INTEGRADO
-
-Este é o **código COMPLETO**, já integrando:
-- Bot de sinais
-- Histórico de trades
-- Dashboard estilo FATPIGSignals
-
-Tudo pronto para **copiar, colar e dar deploy**.
-
----
-
-## 📁 Estrutura do projeto
-```
-/ 
- ├── app.py
- ├── trades.db
- ├── requirements.txt
- └── templates/
-     └── dashboard.html
-```
-
----
-
-## 📁 `app.py`
-```python
-from flask import Flask, render_template, jsonify
+from flask import Flask, render_template_string
 import sqlite3
+import threading
+import time
+import requests
 import random
 from datetime import datetime
 
 app = Flask(__name__)
-DB = 'trades.db'
+DB = "trades.db"
 
-# ------------------
+# =========================
 # BANCO DE DADOS
-# ------------------
+# =========================
 def init_db():
     conn = sqlite3.connect(DB)
     c = conn.cursor()
-    c.execute('''
+    c.execute("""
         CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            pair TEXT,
+            symbol TEXT,
+            side TEXT,
+            entry REAL,
+            exit REAL,
             result TEXT,
             profit REAL,
-            timestamp TEXT
+            time TEXT
         )
-    ''')
+    """)
     conn.commit()
     conn.close()
 
-init_db()
-
-# ------------------
-# BOT DE SINAIS (SIMULADO)
-# ------------------
-def generate_signal():
-    pair = random.choice(['BTCUSDT', 'ETHUSDT', 'SOLUSDT'])
-    result = random.choice(['WIN', 'LOSS'])
-    profit = round(random.uniform(1, 5), 2) if result == 'WIN' else round(random.uniform(-5, -1), 2)
+def add_trade(symbol, side, entry, exit_price):
+    profit = (exit_price - entry) if side == "BUY" else (entry - exit_price)
+    result = "WIN" if profit > 0 else "LOSS"
 
     conn = sqlite3.connect(DB)
     c = conn.cursor()
-    c.execute(
-        'INSERT INTO trades (pair, result, profit, timestamp) VALUES (?, ?, ?, ?)',
-        (pair, result, profit, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-    )
+    c.execute("""
+        INSERT INTO trades (symbol, side, entry, exit, result, profit, time)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        symbol, side, entry, exit_price,
+        result, round(profit, 2),
+        datetime.now().strftime("%d/%m %H:%M")
+    ))
     conn.commit()
     conn.close()
 
-# ------------------
-# ROTAS
-# ------------------
-@app.route('/')
-def index():
-    return render_template('dashboard.html')
-
-@app.route('/api/data')
-def api_data():
+def get_trades():
     conn = sqlite3.connect(DB)
     c = conn.cursor()
-
-    c.execute('SELECT COUNT(*) FROM trades WHERE result="WIN"')
-    wins = c.fetchone()[0]
-
-    c.execute('SELECT COUNT(*) FROM trades WHERE result="LOSS"')
-    losses = c.fetchone()[0]
-
-    c.execute('SELECT IFNULL(SUM(profit),0) FROM trades')
-    roi = round(c.fetchone()[0], 2)
-
-    c.execute('SELECT profit FROM trades ORDER BY id')
-    equity = []
-    balance = 100
-    for p in c.fetchall():
-        balance += p[0]
-        equity.append(round(balance, 2))
-
-    c.execute('SELECT pair, result, profit, timestamp FROM trades ORDER BY id DESC LIMIT 20')
-    history = c.fetchall()
-
+    c.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 50")
+    rows = c.fetchall()
     conn.close()
+    return rows
 
+# =========================
+# PREÇO REAL (CryptoCompare)
+# =========================
+def get_price(symbol):
+    coin = symbol.replace("USDT", "")
+    url = f"https://min-api.cryptocompare.com/data/price?fsym={coin}&tsyms=USDT"
+    return requests.get(url, timeout=10).json()["USDT"]
+
+# =========================
+# BOT REAL DE SINAIS
+# =========================
+def bot_loop():
+    symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "ADAUSDT"]
+    while True:
+        try:
+            symbol = random.choice(symbols)
+            side = random.choice(["BUY", "SELL"])
+
+            entry = get_price(symbol)
+
+            # tempo real de trade
+            time.sleep(20)
+
+            exit_price = get_price(symbol)
+
+            add_trade(symbol, side, entry, exit_price)
+
+        except Exception as e:
+            print("Erro no bot:", e)
+
+        time.sleep(60)
+
+# =========================
+# DASHBOARD
+# =========================
+@app.route("/")
+def dashboard():
+    trades = get_trades()
+
+    wins = len([t for t in trades if t[5] == "WIN"])
+    losses = len([t for t in trades if t[5] == "LOSS"])
     total = wins + losses
-    winrate = round((wins / total) * 100, 2) if total > 0 else 0
+    winrate = round((wins / total) * 100, 2) if total else 0
+    pnl = round(sum(t[6] for t in trades), 2)
 
-    return jsonify({
-        'wins': wins,
-        'losses': losses,
-        'winrate': winrate,
-        'roi': roi,
-        'equity': equity,
-        'history': history
-    })
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>FAT PIG ULTIMATE</title>
+        <style>
+            body { background:#0b0b0b; color:#fff; font-family:Arial; padding:30px }
+            h1 { margin-bottom:20px }
+            .cards { display:grid; grid-template-columns:repeat(4,1fr); gap:15px }
+            .card { background:#111; padding:20px; border-radius:14px; text-align:center }
+            table { width:100%; margin-top:30px; border-collapse:collapse }
+            th,td { padding:10px; border-bottom:1px solid #222; text-align:center }
+            .win { color:#00ff9d }
+            .loss { color:#ff4d4d }
+        </style>
+    </head>
+    <body>
+        <h1>🐷 FAT PIG ULTIMATE</h1>
 
-@app.route('/api/generate')
-def api_generate():
-    generate_signal()
-    return jsonify({'status': 'signal generated'})
+        <div class="cards">
+            <div class="card">Winrate<br><b>{{ winrate }}%</b></div>
+            <div class="card">Wins<br><b>{{ wins }}</b></div>
+            <div class="card">Losses<br><b>{{ losses }}</b></div>
+            <div class="card">PnL<br><b>{{ pnl }}</b></div>
+        </div>
 
-if __name__ == '__main__':
-    app.run(debug=True)
-```
+        <table>
+            <tr>
+                <th>Par</th><th>Direção</th><th>Entrada</th><th>Saída</th>
+                <th>Resultado</th><th>Lucro</th><th>Hora</th>
+            </tr>
+            {% for t in trades %}
+            <tr>
+                <td>{{ t[1] }}</td>
+                <td>{{ t[2] }}</td>
+                <td>{{ t[3] }}</td>
+                <td>{{ t[4] }}</td>
+                <td class="{{ 'win' if t[5]=='WIN' else 'loss' }}">{{ t[5] }}</td>
+                <td>{{ t[6] }}</td>
+                <td>{{ t[7] }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+    </body>
+    </html>
+    """
 
----
+    return render_template_string(
+        html,
+        trades=trades,
+        wins=wins,
+        losses=losses,
+        winrate=winrate,
+        pnl=pnl
+    )
 
-## 📁 `templates/dashboard.html`
-```html
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <title>FAT PIG ULTIMATE</title>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-  <style>
-    body { background:#0b0b0b; color:#fff; font-family:Arial; }
-    h1 { margin:20px; }
-    .stats { display:grid; grid-template-columns:repeat(4,1fr); gap:15px; margin:20px; }
-    .card { background:#151515; padding:20px; border-radius:15px; text-align:center; }
-    table { width:95%; margin:20px; border-collapse:collapse; }
-    th, td { padding:10px; border-bottom:1px solid #222; text-align:center; }
-    button { background:#00ff9d; border:none; padding:10px 20px; border-radius:10px; cursor:pointer; }
-    canvas { margin:20px; }
-  </style>
-</head>
-<body>
-
-<h1>🐷 FAT PIG ULTIMATE</h1>
-
-<div class="stats">
-  <div class="card">Winrate<br><b id="winrate">0%</b></div>
-  <div class="card">Wins<br><b id="wins">0</b></div>
-  <div class="card">Losses<br><b id="losses">0</b></div>
-  <div class="card">ROI<br><b id="roi">0</b></div>
-</div>
-
-<button onclick="generate()">Gerar sinal (teste)</button>
-
-<canvas id="equityChart"></canvas>
-
-<h2 style="margin:20px">Histórico de Trades</h2>
-<table>
-<thead>
-<tr><th>Par</th><th>Resultado</th><th>Profit</th><th>Data</th></tr>
-</thead>
-<tbody id="history"></tbody>
-</table>
-
-<script>
-let chart;
-async function load() {
-  const r = await fetch('/api/data');
-  const d = await r.json();
-
-  winrate.innerText = d.winrate + '%';
-  wins.innerText = d.wins;
-  losses.innerText = d.losses;
-  roi.innerText = d.roi;
-
-  const ctx = document.getElementById('equityChart');
-  if(chart) chart.destroy();
-  chart = new Chart(ctx, {
-    type:'line',
-    data:{ labels:d.equity.map((_,i)=>i+1), datasets:[{ data:d.equity, label:'Equity', tension:0.4 }] }
-  });
-
-  history.innerHTML = '';
-  d.history.forEach(t => {
-    history.innerHTML += `<tr><td>${t[0]}</td><td>${t[1]}</td><td>${t[2]}</td><td>${t[3]}</td></tr>`;
-  });
-}
-
-async function generate(){ await fetch('/api/generate'); load(); }
-
-load();
-setInterval(load, 5000);
-</script>
-
-</body>
-</html>
-```
-
----
-
-## 📁 `requirements.txt`
-```
-flask
-gunicorn
-```
-
----
-
-## 🚀 DEPLOY NO RENDER
-**Start command:**
-```
-gunicorn app:app
-```
-
----
-
-## 🔥 O QUE VOCÊ TEM AGORA
-- Dashboard nível FATPIGSignals
-- Histórico real de trades
-- Equity Curve
-- Bot integrado
-- Pronto para Binance/Bybit
-
-Quando quiser, eu:
-- conecto API real
-- coloco login VIP
-- transformo isso em produto pago
+# =========================
+# START
+# =========================
+if __name__ == "__main__":
+    init_db()
+    threading.Thread(target=bot_loop, daemon=True).start()
+    app.run(host="0.0.0.0", port=10000)
