@@ -7,23 +7,22 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from flask import Flask, render_template_string
-import logging
 from collections import deque
+import logging
 
 # =========================
 # CONFIG
 # =========================
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
+PORT = int(os.getenv("PORT", "10000"))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
-PORT = int(os.getenv("PORT", "10000"))
-DB_FILE = "historico_cripto_v3.json"
+DB_FILE = "historico_cripto_final.json"
 
 # =========================
-# BANCO
+# DATABASE
 # =========================
 def load_db():
     if os.path.exists(DB_FILE):
@@ -51,7 +50,7 @@ def calcular_rsi(series, period=14):
 class BotCriptoPro:
     def __init__(self):
         db = load_db()
-        self.sinais = deque(db["sinais"], maxlen=50)
+        self.sinais = deque(db["sinais"], maxlen=40)
         self.resultados = db["resultados"]
         self.simbolos = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "LINKUSDT", "AVAXUSDT"]
 
@@ -59,8 +58,7 @@ class BotCriptoPro:
         coin = symbol.replace("USDT", "")
         url = f"https://min-api.cryptocompare.com/data/v2/histominute?fsym={coin}&tsym=USDT&limit=200"
         r = requests.get(url, timeout=10).json()
-        df = pd.DataFrame(r["Data"]["Data"])
-        return df
+        return pd.DataFrame(r["Data"]["Data"])
 
     def gerar_sinal(self):
         for symbol in self.simbolos:
@@ -75,7 +73,6 @@ class BotCriptoPro:
             price = last["close"]
 
             direcao = None
-
             if last["ema50"] > last["ema200"] and last["rsi"] < 35:
                 direcao = "COMPRA"
                 tp = price * 1.02
@@ -104,7 +101,7 @@ class BotCriptoPro:
             self.resultados.append(sinal)
             save_db({"sinais": list(self.sinais), "resultados": self.resultados})
             self.enviar_telegram(sinal)
-            break  # apenas 1 sinal por ciclo
+            break
 
     def verificar_resultados(self):
         for s in self.resultados:
@@ -116,7 +113,8 @@ class BotCriptoPro:
 
             coin = s["par"].replace("USDT", "")
             price = requests.get(
-                f"https://min-api.cryptocompare.com/data/price?fsym={coin}&tsyms=USDT"
+                f"https://min-api.cryptocompare.com/data/price?fsym={coin}&tsyms=USDT",
+                timeout=10
             ).json()["USDT"]
 
             if s["direcao"] == "COMPRA":
@@ -127,14 +125,15 @@ class BotCriptoPro:
             save_db({"sinais": list(self.sinais), "resultados": self.resultados})
 
     def stats(self):
-        closed = [r for r in self.resultados if r["status"] in ["WIN", "LOSS"]]
-        if not closed:
-            return {"winrate": 0, "total": 0}
-
+        closed = [r for r in self.resultados if r["status"] in ["WIN","LOSS"]]
         wins = len([r for r in closed if r["status"] == "WIN"])
+        losses = len([r for r in closed if r["status"] == "LOSS"])
+
         return {
-            "winrate": round(wins / len(closed) * 100, 2),
-            "total": len(closed)
+            "winrate": round((wins / len(closed)) * 100, 2) if closed else 0,
+            "total": len(closed),
+            "wins": wins,
+            "losses": losses
         }
 
     def enviar_telegram(self, s):
@@ -162,14 +161,57 @@ def loop():
         time.sleep(600)
 
 # =========================
-# FLASK
+# DASHBOARD PREMIUM
 # =========================
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang='pt-BR'>
+<head>
+<meta charset='UTF-8'>
+<title>Fat Pig Ultimate</title>
+<link href='https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css' rel='stylesheet'>
+<script src='https://cdn.jsdelivr.net/npm/chart.js'></script>
+<style>
+body{background:#050505;color:#eee}
+.card{background:#111;border-radius:20px}
+</style>
+</head>
+<body class='container mt-5'>
+<h2>FAT PIG ULTIMATE</h2>
+
+<div class='row text-center my-4'>
+<div class='col'>Winrate<br><b>{{stats.winrate}}%</b></div>
+<div class='col'>Wins<br><b>{{stats.wins}}</b></div>
+<div class='col'>Losses<br><b>{{stats.losses}}</b></div>
+</div>
+
+<canvas id='wl'></canvas>
+<canvas id='pairs' class='mt-4'></canvas>
+
+<script>
+new Chart(document.getElementById('wl'),{
+ type:'doughnut',
+ data:{labels:['Wins','Losses'],datasets:[{data:[{{stats.wins}},{{stats.losses}}]}]}
+});
+new Chart(document.getElementById('pairs'),{
+ type:'bar',
+ data:{labels:{{pair_labels|safe}},datasets:[{data:{{pair_values|safe}}}]}
+});
+</script>
+</body>
+</html>"""
+
 @app.route("/")
 def index():
     stats = bot.stats()
+    pair_count = {}
+    for r in bot.resultados:
+        pair_count[r["par"]] = pair_count.get(r["par"], 0) + 1
+
     return render_template_string(
-        "<h1>Winrate: {{s.winrate}}% | Total: {{s.total}}</h1>",
-        s=stats
+        DASHBOARD_HTML,
+        stats=stats,
+        pair_labels=list(pair_count.keys()),
+        pair_values=list(pair_count.values())
     )
 
 if __name__ == "__main__":
