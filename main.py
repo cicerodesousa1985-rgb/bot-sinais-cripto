@@ -2,8 +2,19 @@ import threading
 import time
 import sqlite3
 import requests
+import logging
 from datetime import datetime
 from flask import Flask, render_template_string
+
+# ======================
+# LOGGING PROFISSIONAL
+# ======================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%d/%m %H:%M:%S"
+)
+log = logging.getLogger("FATPIG")
 
 # ======================
 # CONFIG
@@ -11,8 +22,8 @@ from flask import Flask, render_template_string
 app = Flask(__name__)
 DB = "trades.db"
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "LINKUSDT", "AVAXUSDT"]
-TP_PERCENT = 0.02   # 2%
-SL_PERCENT = 0.03   # 3%
+TP_PERCENT = 0.02
+SL_PERCENT = 0.03
 
 # ======================
 # BANCO DE DADOS
@@ -38,6 +49,7 @@ def init_db():
     """)
     conn.commit()
     conn.close()
+    log.info("Banco de dados inicializado")
 
 def add_trade(data):
     conn = sqlite3.connect(DB)
@@ -49,6 +61,7 @@ def add_trade(data):
     """, data)
     conn.commit()
     conn.close()
+    log.info(f"Trade salvo | {data[0]} | {data[1]} | {data[6]} | PnL: {data[7]}")
 
 def get_trades():
     conn = sqlite3.connect(DB)
@@ -64,8 +77,7 @@ def get_trades():
 def get_price_and_change(symbol):
     coin = symbol.replace("USDT", "")
     url = f"https://min-api.cryptocompare.com/data/pricemultifull?fsyms={coin}&tsyms=USDT"
-    data = requests.get(url, timeout=10).json()
-    raw = data["RAW"][coin]["USDT"]
+    raw = requests.get(url, timeout=10).json()["RAW"][coin]["USDT"]
     return raw["PRICE"], raw["CHANGEPCT24HOUR"]
 
 def get_sentiment():
@@ -98,6 +110,7 @@ def decide_trade(change):
 # BOT REAL
 # ======================
 def bot_loop():
+    log.info("Bot iniciado")
     while True:
         try:
             for symbol in SYMBOLS:
@@ -106,17 +119,14 @@ def bot_loop():
                 sentiment = get_sentiment()
                 confidence = min(99, max(92, int(abs(change) * 3 + 90)))
 
-                if side == "BUY":
-                    tp = entry * (1 + TP_PERCENT)
-                    sl = entry * (1 - SL_PERCENT)
-                else:
-                    tp = entry * (1 - TP_PERCENT)
-                    sl = entry * (1 + SL_PERCENT)
+                tp = entry * (1 + TP_PERCENT if side == "BUY" else 1 - TP_PERCENT)
+                sl = entry * (1 - SL_PERCENT if side == "BUY" else 1 + SL_PERCENT)
 
-                # tempo real de trade
+                log.info(f"SINAL | {symbol} | {side} | Entrada: {entry:.2f}")
+
                 time.sleep(30)
-                exit_price, _ = get_price_and_change(symbol)
 
+                exit_price, _ = get_price_and_change(symbol)
                 profit = (exit_price - entry) if side == "BUY" else (entry - exit_price)
                 result = "WIN" if profit > 0 else "LOSS"
 
@@ -137,83 +147,74 @@ def bot_loop():
                 time.sleep(60)
 
         except Exception as e:
-            print("Erro no bot:", e)
+            log.error(f"Erro no bot: {e}")
             time.sleep(60)
 
 # ======================
-# DASHBOARD PREMIUM
+# DASHBOARD COM GRÁFICOS
 # ======================
 @app.route("/")
 def dashboard():
     trades = get_trades()
-
-    wins = len([t for t in trades if t[7] == "WIN"])
-    losses = len([t for t in trades if t[7] == "LOSS"])
-    total = wins + losses
-    winrate = round((wins / total) * 100, 2) if total else 0
-    pnl = round(sum(t[8] for t in trades), 2)
+    wins = [t for t in trades if t[7] == "WIN"]
+    losses = [t for t in trades if t[7] == "LOSS"]
+    pnl = [t[8] for t in trades]
 
     html = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>FAT PIG ULTIMATE</title>
-        <style>
-            body { background:#050505; color:#f0f0f0; font-family:Arial; padding:30px }
-            h1 { margin-bottom:20px }
-            .cards { display:grid; grid-template-columns:repeat(5,1fr); gap:15px }
-            .card { background:#111; padding:20px; border-radius:16px; text-align:center }
-            table { width:100%; margin-top:30px; border-collapse:collapse }
-            th,td { padding:10px; border-bottom:1px solid #222; text-align:center }
-            .win { color:#00ff9d }
-            .loss { color:#ff4d4d }
-        </style>
-    </head>
-    <body>
-        <h1>🐷 FAT PIG ULTIMATE</h1>
+<!DOCTYPE html>
+<html>
+<head>
+<title>FAT PIG ULTIMATE</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+body{background:#050505;color:#f0f0f0;font-family:Arial;padding:30px}
+.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:15px}
+.card{background:#111;padding:20px;border-radius:16px;text-align:center}
+canvas{margin-top:30px}
+</style>
+</head>
+<body>
 
-        <div class="cards">
-            <div class="card">Winrate<br><b>{{ winrate }}%</b></div>
-            <div class="card">Wins<br><b>{{ wins }}</b></div>
-            <div class="card">Losses<br><b>{{ losses }}</b></div>
-            <div class="card">PnL<br><b>{{ pnl }}</b></div>
-            <div class="card">Trades<br><b>{{ total }}</b></div>
-        </div>
+<h1>🐷 FAT PIG ULTIMATE</h1>
 
-        <table>
-            <tr>
-                <th>Par</th><th>Lado</th><th>Entrada</th><th>Saída</th>
-                <th>TP</th><th>SL</th><th>Resultado</th>
-                <th>Lucro</th><th>Conf.</th><th>Sentimento</th><th>Hora</th>
-            </tr>
-            {% for t in trades %}
-            <tr>
-                <td>{{ t[1] }}</td>
-                <td>{{ t[2] }}</td>
-                <td>{{ t[3] }}</td>
-                <td>{{ t[4] }}</td>
-                <td>{{ t[5] }}</td>
-                <td>{{ t[6] }}</td>
-                <td class="{{ 'win' if t[7]=='WIN' else 'loss' }}">{{ t[7] }}</td>
-                <td>{{ t[8] }}</td>
-                <td>{{ t[9] }}%</td>
-                <td>{{ t[10] }}</td>
-                <td>{{ t[11] }}</td>
-            </tr>
-            {% endfor %}
-        </table>
-    </body>
-    </html>
-    """
+<div class="cards">
+<div class="card">Winrate<br><b>{{ winrate }}%</b></div>
+<div class="card">Wins<br><b>{{ wins }}</b></div>
+<div class="card">Losses<br><b>{{ losses }}</b></div>
+<div class="card">PnL<br><b>{{ pnl_total }}</b></div>
+</div>
+
+<canvas id="pnlChart"></canvas>
+
+<script>
+const pnlData = {{ pnl|safe }};
+new Chart(document.getElementById("pnlChart"),{
+type:"line",
+data:{
+labels:pnlData.map((_,i)=>i+1),
+datasets:[{
+label:"Equity Curve",
+data:pnlData.reduce((a,x)=>{a.push((a.at(-1)||0)+x);return a},[]),
+borderWidth:3,
+tension:.4
+}]
+}
+});
+</script>
+
+</body>
+</html>
+"""
+    total = len(trades)
+    winrate = round((len(wins)/total)*100,2) if total else 0
 
     return render_template_string(
         html,
-        trades=trades,
-        wins=wins,
-        losses=losses,
+        wins=len(wins),
+        losses=len(losses),
         winrate=winrate,
-        pnl=pnl,
-        total=total
+        pnl_total=round(sum(pnl),2),
+        pnl=pnl
     )
 
 # ======================
