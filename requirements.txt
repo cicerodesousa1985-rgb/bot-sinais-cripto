@@ -1,10 +1,8 @@
-pyTelegramBotAPI
-requests
-pandas
-schedule
 flask
-python-dotenv
-psutil
+requests
 gunicorn
+python-dotenv
+pandas
+ta
 ccxt
 numpy
