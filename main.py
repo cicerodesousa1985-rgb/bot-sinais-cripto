@@ -284,7 +284,6 @@ tr:hover{background:#161616;}
 </body>
 </html>
 """, signals=signals)
-
 # ================= RUN =================
 if __name__ == "__main__":
     threading.Thread(target=bot_loop,daemon=True).start()
