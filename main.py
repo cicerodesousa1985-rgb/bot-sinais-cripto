@@ -1,198 +1,187 @@
-import os
+import ccxt
+import pandas as pd
+import numpy as np
 import time
 import threading
-import requests
-import sqlite3
+from ta.momentum import RSIIndicator, StochasticOscillator
+from ta.trend import EMAIndicator, MACD
+from ta.volatility import BollingerBands
+from flask import Flask, render_template_string
 from datetime import datetime
-from flask import Flask, render_template_string, jsonify
-import logging
-import random
 
-# =========================
-# CONFIG
-# =========================
-PORT = int(os.getenv("PORT", 10000))
-DB_FILE = "trades.db"
+# ================= CONFIG =================
+PAIRS = [
+"BTC/USDT","ETH/USDT","SOL/USDT","BNB/USDT","XRP/USDT",
+"ADA/USDT","AVAX/USDT","DOGE/USDT","MATIC/USDT",
+"LINK/USDT","LTC/USDT","DOT/USDT"
+]
 
-PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "LINKUSDT", "AVAXUSDT", "XRPUSDT", "ADAUSDT"]
-SCORE_MIN = 3
+TIMEFRAME = "5m"
+LIMIT = 150
+STRONG_THRESHOLD = 6
+NORMAL_THRESHOLD = 3
 
-# =========================
-# APP
-# =========================
-app = Flask(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
-log = logging.getLogger()
+exchange = ccxt.binance()
 
-# =========================
-# DATABASE
-# =========================
-def db():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+signals = {}
 
-def init_db():
-    c = db().cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            pair TEXT,
-            side TEXT,
-            entry REAL,
-            tp REAL,
-            sl REAL,
-            result TEXT,
-            pnl REAL,
-            score INTEGER,
-            strategies TEXT,
-            open_time TEXT,
-            close_time TEXT
-        )
-    """)
-    db().commit()
+# ================= DATA =================
+def get_data(pair):
+    ohlc = exchange.fetch_ohlcv(pair, timeframe=TIMEFRAME, limit=LIMIT)
+    df = pd.DataFrame(ohlc, columns=["time","open","high","low","close","volume"])
+    df["time"] = pd.to_datetime(df["time"], unit="ms")
+    return df
 
-init_db()
+# ================= STRATEGIES =================
+def strategy_ema_cross(df):
+    ema9 = EMAIndicator(df["close"], 9).ema_indicator()
+    ema21 = EMAIndicator(df["close"], 21).ema_indicator()
+    if ema9.iloc[-1] > ema21.iloc[-1]:
+        return ("buy",1)
+    elif ema9.iloc[-1] < ema21.iloc[-1]:
+        return ("sell",1)
+    return ("neutral",0)
 
-# =========================
-# MARKET DATA
-# =========================
-def price(pair):
-    coin = pair.replace("USDT", "")
-    r = requests.get(
-        f"https://min-api.cryptocompare.com/data/pricemultifull?fsyms={coin}&tsyms=USDT",
-        timeout=10
-    ).json()
-    data = r["RAW"][coin]["USDT"]
-    return data["PRICE"], data["CHANGEPCT24HOUR"]
+def strategy_rsi(df):
+    rsi = RSIIndicator(df["close"],14).rsi()
+    if rsi.iloc[-1] < 30:
+        return ("buy",1)
+    elif rsi.iloc[-1] > 70:
+        return ("sell",1)
+    return ("neutral",0)
 
-def fear_greed():
-    try:
-        r = requests.get("https://api.alternative.me/fng/", timeout=10).json()
-        v = int(r["data"][0]["value"])
-        return v
-    except:
-        return 50
+def strategy_macd(df):
+    macd = MACD(df["close"])
+    if macd.macd_diff().iloc[-1] > 0:
+        return ("buy",1)
+    elif macd.macd_diff().iloc[-1] < 0:
+        return ("sell",1)
+    return ("neutral",0)
 
-# =========================
-# STRATEGIES (8)
-# =========================
-def strategies(price, change, fg):
-    s = []
-    if change > 2: s.append("Momentum")
-    if change < -2: s.append("Reversão")
-    if fg < 30: s.append("Medo")
-    if fg > 70: s.append("Ganância")
-    if abs(change) > 4: s.append("Volatilidade")
-    if change > 0: s.append("Tendência Alta")
-    if change < 0: s.append("Tendência Baixa")
-    if random.random() > 0.5: s.append("Fluxo")
+def strategy_bb(df):
+    bb = BollingerBands(df["close"],20)
+    if df["close"].iloc[-1] < bb.bollinger_lband().iloc[-1]:
+        return ("buy",1)
+    elif df["close"].iloc[-1] > bb.bollinger_hband().iloc[-1]:
+        return ("sell",1)
+    return ("neutral",0)
 
-    return list(set(s))
+def strategy_volume(df):
+    vol_mean = df["volume"].rolling(20).mean().iloc[-1]
+    if df["volume"].iloc[-1] > vol_mean*1.5:
+        if df["close"].iloc[-1] > df["open"].iloc[-1]:
+            return ("buy",1)
+        else:
+            return ("sell",1)
+    return ("neutral",0)
 
-# =========================
-# BOT LOOP
-# =========================
+def strategy_breakout(df):
+    high = df["high"].rolling(20).max().iloc[-2]
+    low = df["low"].rolling(20).min().iloc[-2]
+    if df["close"].iloc[-1] > high:
+        return ("buy",1)
+    elif df["close"].iloc[-1] < low:
+        return ("sell",1)
+    return ("neutral",0)
+
+def strategy_ema200(df):
+    ema200 = EMAIndicator(df["close"],200).ema_indicator()
+    if df["close"].iloc[-1] > ema200.iloc[-1]:
+        return ("buy",1)
+    else:
+        return ("sell",1)
+
+def strategy_stoch(df):
+    st = StochasticOscillator(df["high"],df["low"],df["close"])
+    if st.stoch().iloc[-1] < 20:
+        return ("buy",1)
+    elif st.stoch().iloc[-1] > 80:
+        return ("sell",1)
+    return ("neutral",0)
+
+# ================= SCORE =================
+def analyze(pair):
+    df = get_data(pair)
+
+    strategies = [
+        strategy_ema_cross,
+        strategy_rsi,
+        strategy_macd,
+        strategy_bb,
+        strategy_volume,
+        strategy_breakout,
+        strategy_ema200,
+        strategy_stoch
+    ]
+
+    results = []
+    score = 0
+    for strat in strategies:
+        s,w = strat(df)
+        results.append((strat.__name__,s))
+        if s != "neutral":
+            score += w if s=="buy" else -w
+
+    if score >= STRONG_THRESHOLD:
+        final = "STRONG BUY"
+    elif score >= NORMAL_THRESHOLD:
+        final = "BUY"
+    elif score <= -STRONG_THRESHOLD:
+        final = "STRONG SELL"
+    elif score <= -NORMAL_THRESHOLD:
+        final = "SELL"
+    else:
+        final = "NEUTRAL"
+
+    signals[pair] = {
+        "pair": pair,
+        "signal": final,
+        "score": score,
+        "details": results,
+        "time": datetime.now().strftime("%H:%M:%S")
+    }
+
+# ================= LOOP =================
 def bot_loop():
     while True:
-        try:
-            pair = random.choice(PAIRS)
-            p, ch = price(pair)
-            fg = fear_greed()
-            used = strategies(p, ch, fg)
-            score = len(used)
+        for pair in PAIRS:
+            try:
+                analyze(pair)
+            except Exception as e:
+                print(pair, e)
+        time.sleep(20)
 
-            log.info(f"{pair} | score {score} | {used}")
+# ================= DASH =================
+app = Flask(__name__)
 
-            if score < SCORE_MIN:
-                time.sleep(60)
-                continue
-
-            side = "BUY" if ch >= 0 else "SELL"
-            tp = p * (1.02 if side == "BUY" else 0.98)
-            sl = p * (0.97 if side == "BUY" else 1.03)
-
-            # Simula fechamento real por preço
-            time.sleep(random.randint(60, 180))
-            final_price, _ = price(pair)
-
-            win = (final_price >= tp if side == "BUY" else final_price <= tp)
-            result = "WIN" if win else "LOSS"
-            pnl = round((tp - p) if win else (sl - p), 2)
-
-            c = db().cursor()
-            c.execute("""
-                INSERT INTO trades
-                (pair, side, entry, tp, sl, result, pnl, score, strategies, open_time, close_time)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                pair, side, p, tp, sl, result, pnl, score,
-                ", ".join(used),
-                datetime.now().strftime("%H:%M:%S"),
-                datetime.now().strftime("%H:%M:%S")
-            ))
-            db().commit()
-
-        except Exception as e:
-            log.error(e)
-
-        time.sleep(random.randint(120, 300))
-
-# =========================
-# DASHBOARD
-# =========================
-@app.route("/")
-def dashboard():
-    c = db().cursor()
-    trades = c.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 50").fetchall()
-
-    wins = sum(1 for t in trades if t["result"] == "WIN")
-    losses = sum(1 for t in trades if t["result"] == "LOSS")
-    winrate = round((wins / max(1, wins + losses)) * 100, 2)
-    pnl = round(sum(t["pnl"] for t in trades), 2)
-
-    return render_template_string(TEMPLATE,
-        trades=trades,
-        wins=wins,
-        losses=losses,
-        winrate=winrate,
-        pnl=pnl
-    )
-
-# =========================
-# HTML
-# =========================
 TEMPLATE = """
-<!DOCTYPE html>
 <html>
 <head>
-<title>FAT PIG ULTIMATE</title>
+<meta http-equiv="refresh" content="10">
 <style>
-body{background:#000;color:#eee;font-family:Arial}
-h1{color:#f5a623}
+body{background:#050505;color:white;font-family:Arial}
+.buy{color:#00ff99}
+.sell{color:#ff4d4d}
+.neutral{color:#ffaa00}
 table{width:100%;border-collapse:collapse}
-th,td{padding:10px;border-bottom:1px solid #222;text-align:center}
-.win{color:#00ff99}
-.loss{color:#ff4d4d}
+td,th{padding:10px;border-bottom:1px solid #222;text-align:center}
 </style>
 </head>
 <body>
-<h1>🐷 FAT PIG ULTIMATE</h1>
-<p>Winrate: {{winrate}}% | PnL: {{pnl}}</p>
-
+<h2>🐷 FAT PIG QUANT SIGNALS</h2>
 <table>
+<tr><th>Par</th><th>Sinal</th><th>Score</th><th>Hora</th><th>Estratégias</th></tr>
+{% for s in signals.values() %}
 <tr>
-<th>Par</th><th>Lado</th><th>Resultado</th><th>Lucro</th><th>Score</th><th>Estratégias</th><th>Hora</th>
-</tr>
-{% for t in trades %}
-<tr>
-<td>{{t.pair}}</td>
-<td>{{t.side}}</td>
-<td class="{{'win' if t.result=='WIN' else 'loss'}}">{{t.result}}</td>
-<td>{{t.pnl}}</td>
-<td>{{t.score}}</td>
-<td>{{t.strategies}}</td>
-<td>{{t.close_time}}</td>
+<td>{{s.pair}}</td>
+<td class="{{ 'buy' if 'BUY' in s.signal else 'sell' if 'SELL' in s.signal else 'neutral' }}">{{s.signal}}</td>
+<td>{{s.score}}</td>
+<td>{{s.time}}</td>
+<td>
+{% for d in s.details %}
+{{d[0]}}={{d[1]}} |
+{% endfor %}
+</td>
 </tr>
 {% endfor %}
 </table>
@@ -200,9 +189,11 @@ th,td{padding:10px;border-bottom:1px solid #222;text-align:center}
 </html>
 """
 
-# =========================
-# START
-# =========================
+@app.route("/")
+def dash():
+    return render_template_string(TEMPLATE, signals=signals)
+
+# ================= START =================
 if __name__ == "__main__":
     threading.Thread(target=bot_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=PORT)
+    app.run(host="0.0.0.0", port=10000)
