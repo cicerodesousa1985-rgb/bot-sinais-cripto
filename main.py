@@ -5,6 +5,9 @@ import threading
 from flask import Flask, render_template_string
 from datetime import datetime
 
+# ================= FLASK APP (FALTAVA ISSO) =================
+app = Flask(__name__)
+
 # ================= CONFIG =================
 PARES = [
 "BTC/USDT","ETH/USDT","SOL/USDT","BNB/USDT","XRP/USDT",
@@ -15,7 +18,6 @@ PARES = [
 exchange = ccxt.binance()
 timeframe = "5m"
 limit = 120
-
 signals_memory = {}
 
 # ================= INDICADORES =================
@@ -128,9 +130,10 @@ def analyze(par):
     final,score = calcular_score(resultados)
 
     signals_memory[par]={
+        "pair":par,
         "signal":final,
         "score":score,
-        "details":usadas,
+        "strategies":", ".join(usadas) if usadas else "Nenhuma",
         "time":datetime.now().strftime("%H:%M:%S")
     }
 
@@ -145,145 +148,21 @@ def bot_loop():
 # ================= DASH =================
 @app.route("/")
 def dashboard():
-    global signals_memory
-
     signals = list(signals_memory.values())
+    return render_template_string(""" 
+    <html><head><meta http-equiv="refresh" content="15">
+    <style>body{background:#0b0b0b;color:white;font-family:Segoe UI}
+    table{width:100%;background:#111}td,th{padding:10px;border-bottom:1px solid #222}
+    .BUY{color:#00ff88}.SELL{color:#ff4444}.NEUTRAL{color:#ffd000}</style></head><body>
+    <h2>🐷 FAT PIG LIVE SIGNALS</h2>
+    <table><tr><th>PAR</th><th>SINAL</th><th>SCORE</th><th>ESTRATÉGIAS</th><th>HORÁRIO</th></tr>
+    {% for s in signals %}
+    <tr><td>{{s.pair}}</td><td class="{{s.signal}}">{{s.signal}}</td>
+    <td>{{s.score}}</td><td>{{s.strategies}}</td><td>{{s.time}}</td></tr>
+    {% endfor %}
+    </table></body></html>
+    """, signals=signals)
 
-    return render_template_string("""
-<!DOCTYPE html>
-<html lang="pt-br">
-<head>
-<meta charset="UTF-8">
-<title>Fat Pig Quant Signals</title>
-<meta http-equiv="refresh" content="20">
-
-<style>
-body{
-    margin:0;
-    background:#0b0b0b;
-    font-family:'Segoe UI',sans-serif;
-    color:white;
-}
-
-header{
-    background:#000;
-    padding:20px;
-    text-align:center;
-    border-bottom:1px solid #222;
-}
-
-header h1{margin:0;font-size:28px;}
-header p{margin:5px 0 0;color:#888;}
-.live{color:#00ff88;font-size:12px;}
-
-.container{padding:20px 30px;}
-
-table{
-    width:100%;
-    border-collapse:collapse;
-    background:#111;
-}
-
-th{
-    text-align:left;
-    padding:14px;
-    font-size:12px;
-    color:#777;
-    border-bottom:1px solid #222;
-}
-
-td{
-    padding:14px;
-    border-bottom:1px solid #181818;
-    font-size:13px;
-}
-
-tr:hover{background:#161616;}
-
-.badge{
-    padding:6px 10px;
-    border-radius:4px;
-    font-weight:bold;
-    font-size:12px;
-}
-
-.buy{background:#003d2a;color:#00ff88;}
-.sell{background:#3a0000;color:#ff3b3b;}
-.neutral{background:#3a3300;color:#ffd000;}
-
-.scorebar{height:6px;background:#222;border-radius:3px;margin-top:6px;}
-.fill{height:6px;border-radius:3px;background:#00ff88;}
-
-.strategy{color:#00ccff;font-size:12px;}
-.time{color:#aaa;font-size:12px;}
-</style>
-</head>
-
-<body>
-
-<header>
-<h1>🐷 FAT PIG QUANT SIGNALS</h1>
-<p>Real Time Crypto Signals</p>
-<div class="live">● LIVE MARKET DATA</div>
-</header>
-
-<div class="container">
-<table>
-<thead>
-<tr>
-<th>PAR</th>
-<th>SINAL</th>
-<th>SCORE</th>
-<th>ESTRATÉGIAS ATIVAS</th>
-<th>DIREÇÃO</th>
-<th>HORÁRIO</th>
-</tr>
-</thead>
-<tbody>
-
-{% for s in signals %}
-<tr>
-<td><b>{{s.pair}}</b></td>
-
-<td>
-<span class="badge 
-{% if 'BUY' in s.signal %}buy
-{% elif 'SELL' in s.signal %}sell
-{% else %}neutral{% endif %}">
-{{s.signal}}
-</span>
-</td>
-
-<td>
-{{s.score}}
-<div class="scorebar">
-<div class="fill" style="width: {{s.score}}%"></div>
-</div>
-</td>
-
-<td class="strategy">{{s.strategies}}</td>
-
-<td>
-{% if 'BUY' in s.signal %}
-<span style="color:#00ff88;">Bullish</span>
-{% elif 'SELL' in s.signal %}
-<span style="color:#ff3b3b;">Bearish</span>
-{% else %}
-<span style="color:#ffd000;">Sideways</span>
-{% endif %}
-</td>
-
-<td class="time">{{s.time}}</td>
-</tr>
-{% endfor %}
-
-</tbody>
-</table>
-</div>
-
-</body>
-</html>
-""", signals=signals)
 # ================= RUN =================
 if __name__ == "__main__":
     threading.Thread(target=bot_loop,daemon=True).start()
