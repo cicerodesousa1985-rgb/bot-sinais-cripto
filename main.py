@@ -1,199 +1,185 @@
 import ccxt
 import pandas as pd
-import numpy as np
 import time
 import threading
-from ta.momentum import RSIIndicator, StochasticOscillator
-from ta.trend import EMAIndicator, MACD
-from ta.volatility import BollingerBands
 from flask import Flask, render_template_string
 from datetime import datetime
 
 # ================= CONFIG =================
-PAIRS = [
+PARES = [
 "BTC/USDT","ETH/USDT","SOL/USDT","BNB/USDT","XRP/USDT",
-"ADA/USDT","AVAX/USDT","DOGE/USDT","MATIC/USDT",
-"LINK/USDT","LTC/USDT","DOT/USDT"
+"ADA/USDT","AVAX/USDT","DOGE/USDT","MATIC/USDT","LINK/USDT",
+"LTC/USDT","DOT/USDT"
 ]
 
-TIMEFRAME = "5m"
-LIMIT = 150
-STRONG_THRESHOLD = 6
-NORMAL_THRESHOLD = 3
-
 exchange = ccxt.binance()
+timeframe = "5m"
+limit = 120
 
-signals = {}
+signals_memory = {}
 
-# ================= DATA =================
-def get_data(pair):
-    ohlc = exchange.fetch_ohlcv(pair, timeframe=TIMEFRAME, limit=LIMIT)
-    df = pd.DataFrame(ohlc, columns=["time","open","high","low","close","volume"])
-    df["time"] = pd.to_datetime(df["time"], unit="ms")
+# ================= INDICADORES =================
+def indicadores(df):
+    df["ema9"] = df.close.ewm(span=9).mean()
+    df["ema21"] = df.close.ewm(span=21).mean()
+    df["ema200"] = df.close.ewm(span=200).mean()
+
+    delta = df.close.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = -delta.clip(upper=0).rolling(14).mean()
+    rs = gain / loss
+    df["rsi"] = 100 - (100 / (1 + rs))
+
+    df["bb_mid"] = df.close.rolling(20).mean()
+    df["bb_std"] = df.close.rolling(20).std()
+    df["bb_up"] = df.bb_mid + 2*df.bb_std
+    df["bb_low"] = df.bb_mid - 2*df.bb_std
+
+    low14 = df.low.rolling(14).min()
+    high14 = df.high.rolling(14).max()
+    df["stoch"] = 100*(df.close-low14)/(high14-low14)
+
     return df
 
-# ================= STRATEGIES =================
-def strategy_ema_cross(df):
-    ema9 = EMAIndicator(df["close"], 9).ema_indicator()
-    ema21 = EMAIndicator(df["close"], 21).ema_indicator()
-    if ema9.iloc[-1] > ema21.iloc[-1]:
-        return ("buy",1)
-    elif ema9.iloc[-1] < ema21.iloc[-1]:
-        return ("sell",1)
-    return ("neutral",0)
+# ================= ESTRATÉGIAS =================
+def estrategia_ema(df):
+    if df.ema9.iloc[-1] > df.ema21.iloc[-1]: return "BUY",2
+    if df.ema9.iloc[-1] < df.ema21.iloc[-1]: return "SELL",2
+    return "NEUTRAL",0
 
-def strategy_rsi(df):
-    rsi = RSIIndicator(df["close"],14).rsi()
-    if rsi.iloc[-1] < 30:
-        return ("buy",1)
-    elif rsi.iloc[-1] > 70:
-        return ("sell",1)
-    return ("neutral",0)
+def estrategia_rsi(df):
+    r = df.rsi.iloc[-1]
+    if r < 30: return "BUY",2
+    if r > 70: return "SELL",2
+    return "NEUTRAL",0
 
-def strategy_macd(df):
-    macd = MACD(df["close"])
-    if macd.macd_diff().iloc[-1] > 0:
-        return ("buy",1)
-    elif macd.macd_diff().iloc[-1] < 0:
-        return ("sell",1)
-    return ("neutral",0)
+def estrategia_bb(df):
+    c = df.close.iloc[-1]
+    if c < df.bb_low.iloc[-1]: return "BUY",2
+    if c > df.bb_up.iloc[-1]: return "SELL",2
+    return "NEUTRAL",0
 
-def strategy_bb(df):
-    bb = BollingerBands(df["close"],20)
-    if df["close"].iloc[-1] < bb.bollinger_lband().iloc[-1]:
-        return ("buy",1)
-    elif df["close"].iloc[-1] > bb.bollinger_hband().iloc[-1]:
-        return ("sell",1)
-    return ("neutral",0)
+def estrategia_volume(df):
+    if df.volume.iloc[-1] > df.volume.iloc[-20:-1].mean()*1.8:
+        if df.close.iloc[-1] > df.open.iloc[-1]: return "BUY",1
+        else: return "SELL",1
+    return "NEUTRAL",0
 
-def strategy_volume(df):
-    vol_mean = df["volume"].rolling(20).mean().iloc[-1]
-    if df["volume"].iloc[-1] > vol_mean*1.5:
-        if df["close"].iloc[-1] > df["open"].iloc[-1]:
-            return ("buy",1)
-        else:
-            return ("sell",1)
-    return ("neutral",0)
+def estrategia_trend(df):
+    if df.close.iloc[-1] > df.ema200.iloc[-1]: return "BUY",1
+    else: return "SELL",1
 
-def strategy_breakout(df):
-    high = df["high"].rolling(20).max().iloc[-2]
-    low = df["low"].rolling(20).min().iloc[-2]
-    if df["close"].iloc[-1] > high:
-        return ("buy",1)
-    elif df["close"].iloc[-1] < low:
-        return ("sell",1)
-    return ("neutral",0)
+def estrategia_breakout(df):
+    r = df.high.iloc[-20:-1].max()
+    s = df.low.iloc[-20:-1].min()
+    if df.close.iloc[-1] > r: return "BUY",2
+    if df.close.iloc[-1] < s: return "SELL",2
+    return "NEUTRAL",0
 
-def strategy_ema200(df):
-    ema200 = EMAIndicator(df["close"],200).ema_indicator()
-    if df["close"].iloc[-1] > ema200.iloc[-1]:
-        return ("buy",1)
-    else:
-        return ("sell",1)
+def estrategia_stoch(df):
+    v = df.stoch.iloc[-1]
+    if v < 20: return "BUY",1
+    if v > 80: return "SELL",1
+    return "NEUTRAL",0
 
-def strategy_stoch(df):
-    st = StochasticOscillator(df["high"],df["low"],df["close"])
-    if st.stoch().iloc[-1] < 20:
-        return ("buy",1)
-    elif st.stoch().iloc[-1] > 80:
-        return ("sell",1)
-    return ("neutral",0)
+def estrategia_macd(df):
+    ema12 = df.close.ewm(span=12).mean()
+    ema26 = df.close.ewm(span=26).mean()
+    macd = ema12-ema26
+    signal = macd.ewm(span=9).mean()
+    if macd.iloc[-1] > signal.iloc[-1]: return "BUY",2
+    else: return "SELL",2
+
+estrategias = [
+("EMA Cross",estrategia_ema),
+("RSI",estrategia_rsi),
+("Bollinger",estrategia_bb),
+("Volume Spike",estrategia_volume),
+("Trend EMA200",estrategia_trend),
+("Breakout",estrategia_breakout),
+("Stochastic",estrategia_stoch),
+("MACD",estrategia_macd)
+]
 
 # ================= SCORE =================
-def analyze(pair):
-    df = get_data(pair)
+def calcular_score(resultados):
+    buy = sum(p for s,p,_ in resultados if s=="BUY")
+    sell = sum(p for s,p,_ in resultados if s=="SELL")
+    total = buy - sell
+    if total >=6: return "STRONG BUY",total
+    if total >=3: return "BUY",total
+    if total <=-6: return "STRONG SELL",total
+    if total <=-3: return "SELL",total
+    return "NEUTRAL",total
 
-    strategies = [
-        strategy_ema_cross,
-        strategy_rsi,
-        strategy_macd,
-        strategy_bb,
-        strategy_volume,
-        strategy_breakout,
-        strategy_ema200,
-        strategy_stoch
-    ]
+# ================= ANALISE =================
+def analyze(par):
+    ohlcv = exchange.fetch_ohlcv(par,timeframe,limit=limit)
+    df = pd.DataFrame(ohlcv,columns=["time","open","high","low","close","volume"])
+    df = indicadores(df)
 
-    results = []
-    score = 0
-    for strat in strategies:
-        s,w = strat(df)
-        results.append((strat.__name__,s))
-        if s != "neutral":
-            score += w if s=="buy" else -w
+    resultados=[]
+    usadas=[]
+    for nome,func in estrategias:
+        s,p = func(df)
+        resultados.append((s,p,nome))
+        if s!="NEUTRAL": usadas.append(nome)
 
-    if score >= STRONG_THRESHOLD:
-        final = "STRONG BUY"
-    elif score >= NORMAL_THRESHOLD:
-        final = "BUY"
-    elif score <= -STRONG_THRESHOLD:
-        final = "STRONG SELL"
-    elif score <= -NORMAL_THRESHOLD:
-        final = "SELL"
-    else:
-        final = "NEUTRAL"
+    final,score = calcular_score(resultados)
 
-    signals[pair] = {
-        "pair": pair,
-        "signal": final,
-        "score": score,
-        "details": results,
-        "time": datetime.now().strftime("%H:%M:%S")
+    signals_memory[par]={
+        "signal":final,
+        "score":score,
+        "details":usadas,
+        "time":datetime.now().strftime("%H:%M:%S")
     }
 
 # ================= LOOP =================
 def bot_loop():
     while True:
-        for pair in PAIRS:
-            try:
-                analyze(pair)
-            except Exception as e:
-                print(pair, e)
-        time.sleep(20)
+        for par in PARES:
+            try: analyze(par)
+            except Exception as e: print(par,e)
+        time.sleep(15)
 
 # ================= DASH =================
 app = Flask(__name__)
 
-TEMPLATE = """
+@app.route("/")
+def dash():
+    return render_template_string("""
 <html>
 <head>
-<meta http-equiv="refresh" content="10">
+<meta http-equiv="refresh" content="20">
 <style>
-body{background:#050505;color:white;font-family:Arial}
-.buy{color:#00ff99}
-.sell{color:#ff4d4d}
+body{background:#0b0b0b;color:white;font-family:Segoe UI}
+h1{text-align:center}
+table{width:95%;margin:auto;border-collapse:collapse}
+td,th{padding:10px;border-bottom:1px solid #1a1a1a;text-align:center}
+.buy{color:#00ff9c;font-weight:bold}
+.sell{color:#ff4d4d;font-weight:bold}
 .neutral{color:#ffaa00}
-table{width:100%;border-collapse:collapse}
-td,th{padding:10px;border-bottom:1px solid #222;text-align:center}
 </style>
 </head>
 <body>
-<h2>🐷 FAT PIG QUANT SIGNALS</h2>
+<h1>🐷 FAT PIG QUANT SIGNALS</h1>
 <table>
-<tr><th>Par</th><th>Sinal</th><th>Score</th><th>Hora</th><th>Estratégias</th></tr>
-{% for s in signals.values() %}
+<tr><th>Par</th><th>Sinal</th><th>Score</th><th>Estratégias</th><th>Hora</th></tr>
+{% for p,s in signals.items() %}
 <tr>
-<td>{{s.pair}}</td>
-<td class="{{ 'buy' if 'BUY' in s.signal else 'sell' if 'SELL' in s.signal else 'neutral' }}">{{s.signal}}</td>
+<td>{{p}}</td>
+<td class="{{'buy' if 'BUY' in s.signal else 'sell' if 'SELL' in s.signal else 'neutral'}}">{{s.signal}}</td>
 <td>{{s.score}}</td>
+<td>{{", ".join(s.details)}}</td>
 <td>{{s.time}}</td>
-<td>
-{% for d in s.details %}
-{{d[0]}}={{d[1]}} |
-{% endfor %}
-</td>
 </tr>
 {% endfor %}
 </table>
 </body>
 </html>
-"""
+""",signals=signals_memory)
 
-@app.route("/")
-def dash():
-    return render_template_string(TEMPLATE, signals=signals)
-
-# ================= START =================
+# ================= RUN =================
 if __name__ == "__main__":
-    threading.Thread(target=bot_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=10000)
+    threading.Thread(target=bot_loop,daemon=True).start()
+    app.run(host="0.0.0.0",port=10000)
